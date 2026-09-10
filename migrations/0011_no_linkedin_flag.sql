@@ -1,0 +1,47 @@
+-- 0011 — "no LinkedIn presence" flag (REL-011, issue #26).
+--
+-- The Missing LinkedIn worklist needs one thing the schema could not express: the difference between
+-- "I have not looked yet" and "I looked, and there is nothing to find".
+--
+-- Without it the worklist is a list you can never finish. 61 active non-terminal contacts have no
+-- linkedin_url on prod today (counted 2026-08-11, against 97 missing across all 295 contacts — the
+-- other 36 are in terminal stages and the worklist excludes them). Some of those 61 people genuinely
+-- have no profile: the importer already had to leave URLs blank where the LinkedIn connections export had no
+-- match at all, and no amount of searching turns that into a URL. Each one would sit on the list
+-- forever, and a worklist with permanent residents stops being read.
+--
+-- Why a flag and not a sentinel value in linkedin_url
+-- --------------------------------------------------
+-- The alternative was a reserved string — 'none', or an empty-but-not-null value — meaning "checked,
+-- nothing there". That corrupts the field's meaning: linkedin_url is read as a URL in six places
+-- (contact record, contact list row, import preview, CSV export, and routesFor() in escalation.ts,
+-- which decides whether the ladder can suggest LinkedIn at all). Every one of them would have to learn
+-- the sentinel, and the one that forgot would render a link to a page that does not exist. A separate
+-- column cannot be misread as an address.
+--
+-- Why the name is a negative
+-- --------------------------
+-- `no_linkedin = 1` rather than `has_linkedin = 0`, which makes the worklist predicate read as a double
+-- negative (`no_linkedin = 0`). Accepted deliberately: the DEFAULT has to mean "nothing asserted", and
+-- with a positive name the default 0 would be the assertion "they have no LinkedIn" applied to all 295
+-- existing rows. A default that states a fact about data nobody has looked at is the worse trade. The
+-- flag is only ever set by a person clicking the button on /linkedin.
+--
+-- INTEGER NOT NULL DEFAULT 0 rather than a nullable flag: SQLite accepts a constant default on ADD
+-- COLUMN without rewriting the table (unlike 0005 and 0009, which had to rebuild it to widen a CHECK
+-- constraint), and NOT NULL means no read has to handle three states where two exist.
+--
+-- No backfill. Nothing in the data distinguishes "no profile exists" from "not searched yet" — the
+-- importer's `linkedin_match = 'ambiguous'` flag says several connections share the name, which is the
+-- opposite case, and its blank-with-no-flag case says only that the connections export had no row. Guessing
+-- here would silently retire contacts from the worklist that nobody has actually reviewed.
+--
+-- Rollback: ALTER TABLE contact DROP COLUMN no_linkedin;
+--   Supported in SQLite 3.35+ and D1. Loses which contacts were marked, which is unrecoverable from the
+--   contact row — but every marking writes an audit_event, so the set is reconstructable from the trail.
+
+ALTER TABLE contact ADD COLUMN no_linkedin INTEGER NOT NULL DEFAULT 0;
+
+-- The worklist filters on exactly this shape on every load: active, non-terminal, no URL, not flagged.
+-- Small table, so this is about intent as much as speed — the index names the query that exists.
+CREATE INDEX idx_contact_no_linkedin ON contact(status, no_linkedin, priority_tier);

@@ -1,0 +1,54 @@
+-- 0015 — per-contact keep-in-touch cadence (REL-027, issue #93).
+--
+-- WHAT WAS BROKEN. Stay Connected and Pray are both live stages (ACTIVE_STAGES in types.ts), which had two
+-- consequences nobody chose:
+--
+--   1. With no follow-up date they sat in dashboard section 7, Needs Attention, PERMANENTLY — flagged
+--      "no follow-up date" with no way to satisfy the flag except setting a date by hand, forever.
+--   2. Once a date was set and the touch happened, NOTHING set the next one. They dropped off every list
+--      until they resurfaced as adrift.
+--
+-- And `docs/definitions.md §4` had specified a cadence since 2026-07-29 — every 30 days for strong, 60 for
+-- warm — that was never built. The file described the app while the app did something else, for six weeks.
+-- That gap is now annotated in §4 rather than quietly closed.
+--
+-- WHY PER-CONTACT AND NOT DERIVED FROM STRENGTH
+-- ---------------------------------------------
+-- A deliberate choice over the §4 rule as written. Relationship strength is one
+-- fact about someone; how often you want to reach out is another, and they do not always agree. A Pray
+-- contact might want weekly; a former colleague you are simply fond of might want yearly; both could be
+-- "strong". Deriving the interval would have made those two indistinguishable.
+--
+-- NO BACKFILL, and this one matters. A cadence nobody chose is a commitment the app invented on the
+-- operator's behalf, and it would immediately start writing follow-up dates onto 295 contacts. NULL means "no
+-- cadence", which stays the state of every existing row until one is set.
+--
+-- HOW IT APPLIES, in precedence order (contacts.ts, the interaction POST):
+--   1. a date typed on the form always wins — the field is the decision
+--   2. otherwise the contact's cadence, counted from the interaction's own date
+--   3. otherwise, only when resolving a meeting, the generic fallback that already existed
+-- The cadence beats the generic fallback deliberately: after a catch-up with a Stay Connected contact on a
+-- 90-day rhythm, the right next date is 90 days out, not the three-business-day guess that suits a chase.
+-- Terminal stages get nothing, cadence or not — finished is finished.
+--
+-- WHAT THIS DELIBERATELY DOES **NOT** DO — a correction to the issue as written
+-- ---------------------------------------------------------------------------
+-- #93 said section 7 should stop holding a Stay Connected or Pray contact that has a cadence, "because the
+-- cadence is its next step". On inspection that is wrong and was not implemented. A cadence only produces
+-- a date when an interaction is recorded, so a contact with a cadence and no touch yet has NO date and NO
+-- next step — and suppressing them would make them invisible, which is the single failure this dashboard
+-- exists to prevent. Section 7 keeps them and now says why: "cadence every 90 days · no touch recorded
+-- yet", which names the fix instead of hiding the row.
+--
+-- Bounds: 1 to 1095 days (three years). Zero or negative would compute a date in the past on every touch;
+-- the upper bound is a typo guard, and three years is past the point where "keep in touch" means anything.
+--
+-- Rollback: ALTER TABLE contact DROP COLUMN touch_interval_days;
+--   Loses which contacts had a cadence. Recoverable from audit_event, which records every change to it.
+
+ALTER TABLE contact ADD COLUMN touch_interval_days INTEGER
+  CHECK (touch_interval_days IS NULL OR (touch_interval_days >= 1 AND touch_interval_days <= 1095));
+
+-- No index. Nothing queries BY interval — it is read one contact at a time when an interaction is saved,
+-- already by primary key, and section 7 reads it only to explain a row it has already selected. An index
+-- here would be cargo cult.

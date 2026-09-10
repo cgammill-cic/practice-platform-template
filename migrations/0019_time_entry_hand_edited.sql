@@ -1,0 +1,41 @@
+-- 0019_time_entry_hand_edited.sql
+--
+-- Marks an imported time entry that a human has since corrected, so the next import stops overwriting it.
+--
+-- THE HOLE THIS CLOSES. Migration 0017 protected the Comments field from re-import, and the PR that
+-- shipped it said plainly that the rest of the row was still exposed. This is that:
+--
+--   1. Import a week. A calendar row says 1 hour.
+--   2. The meeting actually ran two. Correct it on /time — hours now 2.
+--   3. Re-import the same week for any reason. Outlook still says 1 hour. **Your correction is gone**,
+--      silently, with no flag and nothing in the trail saying a number moved.
+--
+-- That is the natural sequence, not an edge case: you import, you notice something wrong, you fix it, and
+-- weeks get re-imported all the time — a category added in Outlook, a meeting renamed, a customer set.
+-- And it lands on the one number that becomes an invoice.
+--
+-- WHY A COLUMN RATHER THAN A SOURCE CHANGE. The obvious fix is to flip `source` from 'calendar' to
+-- something else on edit, since the import already scopes its updates to `source = 'calendar'`. That is
+-- worse than the bug: the import matches on `outlook_ref AND source = 'calendar'`, so a row that changed
+-- source would no longer be found — and the import would cheerfully INSERT A SECOND ROW for the same
+-- event. Silent overwriting would become silent duplication, which on a timesheet is the wrong direction
+-- for the error.
+--
+-- WHAT COUNTS AS A HAND EDIT. Only the facts the calendar also claims: date, hours, activity, customer.
+-- Editing the Comments field deliberately does NOT set this flag — comments are already safe from the
+-- import (0017), and locking a row because someone annotated it would stop legitimate refreshes for no
+-- gain. The flag means "a human and Outlook disagree about this row", not "a human touched this row".
+--
+-- NOT A PERMANENT LOCK. The import preview shows a flagged row unticked with the reason. Ticking it is an
+-- explicit instruction to take Outlook's version, which clears the flag. The default protects the
+-- correction; the deliberate act overrides it. Anything stricter would mean a genuinely wrong entry could
+-- never be re-synced without editing the database by hand.
+--
+-- NO BACKFILL NEEDED. Defaults to 0, and every existing row is either hand-typed (never touched by the
+-- import anyway) or imported-and-unedited (0 is correct). `time_entry` also still holds 0 rows in
+-- production at the time of writing.
+--
+-- ROLLBACK. `ALTER TABLE time_entry DROP COLUMN hand_edited;` — SQLite 3.35+. Re-import reverts to
+-- overwriting corrections, which is the behaviour this replaces.
+
+ALTER TABLE time_entry ADD COLUMN hand_edited INTEGER NOT NULL DEFAULT 0;

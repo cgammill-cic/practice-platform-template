@@ -1,0 +1,31 @@
+-- 0017_time_entry_subject.sql
+--
+-- Separates the calendar's words from the operator's words on a time entry.
+--
+-- WHY THIS EXISTS. `time_entry.note` was built as a free-text field for the person logging time. The
+-- calendar import (M365-001, #104) then wrote the Outlook event subject into that same column, because at
+-- the time it was the only text field on the row. That quietly took the field away: on any imported entry
+-- `note` already held the subject, and anything typed there by hand would be overwritten the next time
+-- that week was re-imported. There was nowhere on a time entry to write a sentence and have it survive.
+--
+-- "it would be good to include a free form 'Comments' section so that if I needed to
+-- add additional context, that I can capture that." (2026-08-13)
+--
+-- THE SPLIT. After this migration:
+--   subject — what the calendar called the event. Written only by the import. Never typed.
+--   note    — the operator's comments. Never written by the import, on create or on update.
+--
+-- Two text fields on one row needs a reason, and this is it: they have different owners. Merging them
+-- means either the import destroys a comment or a comment suppresses the event's real name, and both are
+-- silent. The report shows them together, so nothing is hidden by the separation.
+--
+-- WHY NOW AND NOT LATER. `time_entry` holds 0 rows in production and 0 in dev at the time of writing, so
+-- there is no backfill and no ambiguity about which column a given string came from. The first import
+-- closes that window permanently: after it, every calendar row's `note` holds a subject and no query can
+-- tell that apart from a comment the operator typed. This is the last cheap moment to get it right.
+--
+-- ROLLBACK. `ALTER TABLE time_entry DROP COLUMN subject;` — supported in SQLite 3.35+ and safe here, since
+-- nothing else references the column. Any subjects written since would be lost, which is acceptable: the
+-- subject is a copy of what Outlook still holds and a re-import restores it.
+
+ALTER TABLE time_entry ADD COLUMN subject TEXT;

@@ -1,0 +1,29 @@
+{
+  "name": "practice-platform",
+  "main": "src/index.ts",
+  "compatibility_date": "2026-07-01",
+  "observability": { "enabled": true },
+  // Nightly backup: 07:00 UTC = 2:00 AM US Central (daylight time)
+  // 07:00 UTC nightly backup. The two weekday entries are the daily digest: Cloudflare crons are UTC and
+  // do not shift with daylight saving, so a single fixed time drifts an hour twice a year. Both fire and
+  // the run checks whether it is currently the 6 o'clock hour in US Central — exactly one passes on any
+  // given day, and the other returns immediately. See src/digest.ts, decision 4.
+  "triggers": { "crons": ["0 7 * * *", "0 11 * * 1-5", "0 12 * * 1-5"] },
+  // No database_id here — this is a template, so there's no shared database to point at. The
+  // "Deploy to Cloudflare" button provisions a fresh D1 database on YOUR account and fills this in
+  // automatically. Setting up by hand instead: `wrangler d1 create <name>`, then paste the id it prints
+  // as `database_id` below — see docs/local-setup.md and docs/runbook.md.
+  "d1_databases": [
+    {
+      "binding": "DB",
+      "database_name": "practice-platform-prod",
+      "migrations_dir": "migrations"
+    }
+  ],
+  "r2_buckets": [
+    {
+      "binding": "BACKUPS",
+      "bucket_name": "practice-platform-backups"
+    }
+  ]
+}

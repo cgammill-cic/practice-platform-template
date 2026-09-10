@@ -1,0 +1,20 @@
+# Line endings: LF in the repository, LF in the working tree.
+#
+# Without this, a Windows checkout leaves CRLF files sitting against LF blobs, so
+# every tracked file reports as fully modified and a three-line change arrives as
+# a thousand-line diff. That is what made #37 look risky enough to defer for a
+# day: the diff could not be reviewed, so the dead route was left in place.
+* text=auto eol=lf
+
+# Never normalize these.
+*.png  binary
+*.jpg  binary
+*.jpeg binary
+*.gif  binary
+*.ico  binary
+*.pdf  binary
+*.xlsx binary
+*.xls  binary
+*.woff binary
+*.woff2 binary
+*.sqlite binary

@@ -1,0 +1,24 @@
+# Copy this file to `.dev.vars` for local development, or fill these in as secrets when the "Deploy to
+# Cloudflare" button asks for them. See docs/local-setup.md.
+
+# Required. The passphrase used to sign in to the app.
+APP_PASSWORD=
+
+# Required. Any long random string — used to sign the session cookie. A local-only value is fine for
+# development; use a different, unguessable value in production.
+SESSION_SECRET=
+
+# Optional. Your deployment's own URL (e.g. https://your-worker.your-subdomain.workers.dev, or a custom
+# domain). Used only to build a clickable link in the daily digest email. Leave blank and the digest
+# still sends, just without that link.
+APP_URL=
+
+# Optional. Microsoft Graph credentials for connecting an Outlook mailbox and calendar. Leave all three
+# blank and the app runs normally, with the Outlook panel on /health reporting that it is not configured.
+MS_CLIENT_ID=
+MS_TENANT_ID=
+MS_CLIENT_SECRET=
+
+# Optional. A Windows timezone id (not IANA) for reading the connected calendar, when Graph itself does
+# not say what timezone the mailbox uses. Defaults to Central Standard Time.
+MS_TIMEZONE=
