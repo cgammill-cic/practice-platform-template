@@ -30,10 +30,12 @@ privilege. Every feature useful on its own.
 
 [![Deploy to Cloudflare](https://deploy.workers.cloudflare.com/button)](https://deploy.workers.cloudflare.com/?url=https://github.com/cgammill-cic/practice-platform-template)
 
-The fastest path is the **Deploy to Cloudflare** button above — it provisions your own D1 database and R2
-bucket, wires up auto-deploy from your own fork of this repo, and prompts you for secrets. See
-`docs/local-setup.md` for the full walkthrough, including running it locally first if you'd rather
-develop before deploying.
+The **Deploy to Cloudflare** button above provisions your own D1 database and R2 bucket, forks this repo
+into your own GitHub account, wires up auto-deploy, and prompts you for secrets. It does **not** run the
+database migrations — your new database is created empty, and the first sign-in will fail with an
+Internal Server Error until you apply them. See **`docs/local-setup.md` → "After clicking Deploy"** for
+the one command that fixes this, and for the full walkthrough (including running it locally first if
+you'd rather develop before deploying).
 
 ## Working agreements
 

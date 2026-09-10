@@ -5,6 +5,46 @@
 
 ---
 
+## After clicking Deploy
+
+The **Deploy to Cloudflare** button does almost everything: it forks the repo into your GitHub account,
+creates a Worker, and provisions a fresh D1 database and R2 bucket, all wired together automatically. The
+one thing it does **not** do is run the database migrations — your new database is created completely
+empty, with no tables. Visiting your new site and trying to sign in fails with **Internal Server Error**
+until you fix this. It's a one-time step, and it's the same for every fresh deployment:
+
+1. Install [Node 20+](https://nodejs.org) and [Git for Windows](https://git-scm.com/downloads/win) if you
+   don't already have them (see "What you need first" below for details).
+2. Clone **your own fork** — not this template, the copy the Deploy button created under your GitHub
+   account. It's named after the project name you chose during deploy.
+   ```powershell
+   git clone https://github.com/<your-username>/<your-project-name>
+   cd <your-project-name>
+   npm install
+   ```
+3. Sign in to Cloudflare from the command line — this opens a browser window once:
+   ```powershell
+   npx wrangler login
+   ```
+4. Apply every migration to your new database in one command. Cloudflare already wrote your database's
+   name into `wrangler.jsonc` during deploy, so this needs no editing:
+   ```powershell
+   npx wrangler d1 migrations apply <your-project-name>-db --remote
+   ```
+   (If you renamed the database during deploy, use that name instead — check the `database_name` field in
+   `wrangler.jsonc` if you're not sure.)
+5. Reload your site. Sign in with the `APP_PASSWORD` you set during deploy.
+
+That's it — steps 1-4 only ever need to happen once, right after your first deploy. From then on your app
+works normally, and any *future* migration (if you pull in an update from the template) is applied the same
+way: `npx wrangler d1 migrations apply <your-project-name>-db --remote`.
+
+**Sending this app to someone else?** Every person who clicks the Deploy button gets their own completely
+separate copy — their own database, their own Worker, their own data, invisible to you and to anyone else's
+deployment. Each of them needs to do the one-time steps above once for their own copy.
+
+---
+
 ## First: you may not need a terminal at all
 
 There is a **desktop app** that runs Claude Code with a graphical interface — no terminal. Download for

@@ -161,6 +161,46 @@ time-entry data — see `src/vocabulary.ts` for what each state means.
 `outlook` reports `configured`, `connected` and the last error. It deliberately does **not** include which
 account is connected — a monitor needs to know whether the link is alive, not whose mailbox it is.
 
+## Setting up Outlook for the first time
+
+Skip this whole section if you don't use Outlook, or want to add it later — the app runs fully without it,
+and `/health` will just say the Outlook connection isn't configured.
+
+Connecting Outlook needs an app registration in Microsoft Entra (Microsoft's name for what used to be
+called Azure AD) — a small, free, one-time setup that gives your deployment permission to read your own
+calendar and mail. This only needs doing once per deployment, by whoever's mailbox is being connected.
+
+1. Go to <https://entra.microsoft.com> and sign in with the same Microsoft account whose calendar you want
+   to connect (a personal Microsoft 365 account works fine — you don't need to be part of an organization).
+2. **App registrations** (left sidebar, under Identity) → **New registration**.
+3. Name it anything — "Practice Platform" is fine. Under **Supported account types**, choose "Accounts in
+   this organizational directory only" (the single-tenant option) unless you specifically need otherwise.
+4. Under **Redirect URI**, choose platform **Web** and enter:
+   ```
+   https://<your-worker-url>/auth/microsoft/callback
+   ```
+   using your actual deployment's URL (the one from the Domains tab in the Cloudflare dashboard, or the
+   `APP_URL` you set during deploy) — for example
+   `https://practice-platform.your-subdomain.workers.dev/auth/microsoft/callback`.
+5. Click **Register**. On the app's Overview page, copy two values:
+   - **Application (client) ID** → this is `MS_CLIENT_ID`
+   - **Directory (tenant) ID** → this is `MS_TENANT_ID`
+6. **Certificates & secrets** (left sidebar) → **New client secret** → give it any description, pick an
+   expiry (24 months is reasonable) → **Add**. Immediately copy the **Value** column (not the Secret ID) —
+   this is `MS_CLIENT_SECRET`, and Microsoft only shows it once. Note the expiry date somewhere; when it
+   lapses, the calendar import stops and the fix is a new secret here.
+7. **API permissions** (left sidebar) → **Add a permission** → **Microsoft Graph** → **Delegated
+   permissions** → add all of: `User.Read`, `Calendars.Read`, `Mail.ReadBasic`, `Mail.Send`,
+   `offline_access` (this last one may already be listed by default). If you see a **Grant admin consent**
+   button and you're the only person in your tenant, click it — this saves the consent prompt on first
+   sign-in. If you don't see it or aren't sure, skip it; you'll be prompted to consent when you connect.
+8. Put the three values into your deployment:
+   - Locally, add them to `.dev.vars` (see "Setup, once" in `docs/local-setup.md`).
+   - In production, go to your Worker in the Cloudflare dashboard → **Settings → Variables and Secrets** →
+     add `MS_CLIENT_ID`, `MS_TENANT_ID` and `MS_CLIENT_SECRET` as **secrets**, then redeploy (or just save —
+     Workers picks up new secret values on the next request for most changes; a fresh deploy guarantees it).
+9. Continue to **Connecting**, below.
+
 ## Outlook calendar connection
 
 **Connecting:** `/health` → Outlook Calendar panel → **Connect Outlook**. Sign in once; the app stores a
