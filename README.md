@@ -1,84 +1,61 @@
-# practice-platform
+# Practice Platform
 
-A private practice management platform for independent consultants and advisors: relationships,
-follow-ups, time tracking, and reporting. One place to know who matters, what has happened, what should
-happen next, what work was performed, and what should be invoiced.
+A private practice-management app for independent advisors: relationships and follow-ups, meetings,
+outreach drafting, pursuits and customers, time tracking, and a daily digest. It runs as your own copy
+in your own Cloudflare account, with your own database. Nobody else, including whoever set it up for you,
+can see your data unless you give them access.
 
-**North star:** capture information once, reuse it everywhere.
-
-This is a template — deploy your own independent copy on your own Cloudflare account. Nobody else,
-including whoever maintains the upstream template, has access to your data.
-
-## Architecture
+## What's in your copy
 
 | Layer | Component |
 |---|---|
-| UI | Server-rendered HTML from the Worker (Hono) |
-| Logic | Cloudflare Workers (Hono, TypeScript) |
-| Data | Cloudflare D1 (SQLite) |
-| Files | Cloudflare R2 (backups) |
-| Identity | Passphrase session |
-| Calendar/mail | Microsoft Graph, delegated, read-only for calendar/mail metadata, send-as-self for the daily digest (optional — the app runs fully without it) |
+| App | Cloudflare Workers (Hono, TypeScript), server-rendered pages |
+| Data | Cloudflare D1 (SQLite) in your account |
+| Files | Cloudflare R2 in your account: nightly backups, your logo |
+| Sign-in | Named accounts (email and password) plus an owner passphrase for emergencies |
+| Calendar and mail (optional) | Microsoft Outlook via Microsoft Graph: meeting sync, email logging, the digest, drafts |
+| Outreach drafting (optional) | Anthropic's Claude, with your own API key |
 
-## Principles
+## First visit
 
-Relationships before pipeline. Capture once, reuse everywhere. Draft, then approve — automation prepares
-records for review; it never silently posts data you haven't seen. Integrate rather than recreate. Least
-privilege. Every feature useful on its own.
+The first time anyone opens a new copy, it shows **Set up this copy**. Enter the owner passphrase chosen
+when the copy was deployed (`APP_PASSWORD`), then your name, email and a password. The app builds its
+database and signs you in as the first admin. Then:
 
-## Deploy your own copy
+1. **Settings** (Data → Settings): your firm name, app name, timezone, digest hour and logo.
+2. **Users**: add the people who should have access.
+3. **Health**: connect Outlook if you use it.
+4. **Outreach → Voice & limits**: your name and a line about your practice, if you use drafting.
 
-[![Deploy to Cloudflare](https://deploy.workers.cloudflare.com/button)](https://deploy.workers.cloudflare.com/?url=https://github.com/cgammill-cic/practice-platform-template)
+## Secrets
 
-The **Deploy to Cloudflare** button above provisions your own D1 database and R2 bucket, forks this repo
-into your own GitHub account, wires up auto-deploy, and prompts you for secrets. It does **not** run the
-database migrations — your new database is created empty, and the first sign-in will fail with an
-Internal Server Error until you apply them. See **`docs/local-setup.md` → "After clicking Deploy"** for
-the one command that fixes this, and for the full walkthrough (including running it locally first if
-you'd rather develop before deploying).
+Set in Cloudflare: Workers & Pages → your worker → Settings → Variables and Secrets. Always choose type
+**Secret**, never plain text.
 
-## Working agreements
-
-- No secrets, personal data, or production tokens in the repository. Secrets live in Cloudflare
-  (Settings → Variables and Secrets).
-- Database migrations are versioned and applied by hand — see `docs/runbook.md`.
-- Keep a decision log (`docs/decision-log.md`) — write down why, not just what.
-
-## Running it locally
-
-```
-git clone https://github.com/<your-username>/<your-repo>
-cd <your-repo>
-npm install
-# create .dev.vars with APP_PASSWORD and SESSION_SECRET — throwaway values, not your production ones
-npm run db:local    # build a local database from the migrations
-npm run dev         # then open http://localhost:8787
-```
-
-Needs Node 20+. Clone it somewhere plain and local — **not inside OneDrive or Dropbox**, which will try
-to sync `node_modules` and make a mess of builds and git state.
-
-`npm run check` before every pull request. Migrations are applied by hand, dev then prod, before the
-merge — a merge auto-deploys but cannot touch D1.
-
-Full setup, the working agreements, and where to start reading: **`docs/local-setup.md`**.
-
-## Environments
-
-| Environment | Purpose | Database |
+| Name | Required | Purpose |
 |---|---|---|
-| Production | `main` branch auto-deploys to your Worker's URL | `<yourapp>-prod` |
-| Preview | Pull requests get automatic preview URLs | (no real data) |
-| Local | `npm run dev` — local simulation | local SQLite, touches nothing real |
+| `APP_PASSWORD` | yes | The owner passphrase: first-run setup, and an emergency way in |
+| `SESSION_SECRET` | yes | Signs sign-in sessions. A long random string. Changing it signs everyone out and disconnects Outlook |
+| `MS_CLIENT_ID`, `MS_TENANT_ID`, `MS_CLIENT_SECRET` | no | Your Microsoft app registration, for Outlook |
+| `ANTHROPIC_API_KEY` | no | For outreach drafting. Create it inside a **workspace** at console.anthropic.com |
 
-## Runbook
+## Updates
 
-Deploy, rollback, secrets, databases, health check: see [docs/runbook.md](docs/runbook.md).
+See [docs/UPDATING.md](docs/UPDATING.md). In short: sync your copy with the template on GitHub, wait for
+it to redeploy, then click **Apply Updates** on the Health page if it asks.
 
-## Repository layout
+## Running it locally (for developers)
 
 ```
-/docs          decision-log.md, definitions.md, runbook.md, local-setup.md
-/migrations    versioned D1 migrations
-/src           application code
+npm install
+cp .dev.vars.example .dev.vars   # throwaway local values
+npm run db:local                 # build a local database from the migrations
+npm run dev                      # http://localhost:8787
 ```
+
+`npm run check` runs the type check and confirms the generated schema manifest and migrations bundle are
+current. After adding a migration: `npm run schema:manifest && npm run migrations:bundle`.
+
+## License
+
+See `LICENSE`. This software is licensed per copy; it is not open source.

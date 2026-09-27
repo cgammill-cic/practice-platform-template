@@ -1,8 +1,8 @@
 /*
  * REL-008 Part A — message templates (#19).
  *
- * The request was for a "message template" link to easily create a message template, copy it, and paste
- * it into Outlook.
+ * "I think I should have a 'message template' link where I can easily create a message template, copy
+ * and paste into Outlook." — the owner, 2026-08-01.
  *
  * The whole feature is judged on one moment: you are looking at a person, you want the words, you
  * paste them into Outlook. Everything here serves that. Pick a contact, the placeholders resolve
@@ -11,9 +11,9 @@
  * Three design notes worth stating, because each was a choice rather than an inevitability.
  *
  * 1. TEMPLATES ARE A LIBRARY, NOT A LADDER. rung is optional. The escalation ladder (Part B) will
- *    point at rungs 1-3, but the request was to keep adding more communications templates over time,
- *    and most of what gets written — a thank-you, an intro request — belongs to no rung. Requiring one
- *    would make the library refuse the majority of its own use cases.
+ *    point at rungs 1-3, but the owner asked to "add more communications templates", and most of what
+ *    he will write — a thank-you, an intro request — belongs to no rung. Requiring one would make the
+ *    library refuse the majority of its own use cases.
  *
  * 2. SUBSTITUTION HAPPENS SERVER-SIDE. The resolved text is rendered into the page and the only
  *    client-side JavaScript is the clipboard call itself. Doing the substitution in the browser would
@@ -29,9 +29,9 @@
 import { Hono } from "hono";
 import { esc, layout, select } from "./views";
 import type { Bindings, D1Db } from "./types";
+import { actor } from "./auth";
 
 const app = new Hono<{ Bindings: Bindings }>();
-const ACTOR = "operator";
 
 const CHANNELS = [
   ["email", "Email"],
@@ -71,15 +71,15 @@ async function audit(db: D1Db, id: number, action: string, after: string, before
     .prepare(
       "INSERT INTO audit_event (actor, entity, entity_id, action, before_summary, after_summary, source) VALUES (?,?,?,?,?,?,'app')"
     )
-    .bind(ACTOR, "message_template", String(id), action, before ?? null, after)
+    .bind(actor(), "message_template", String(id), action, before ?? null, after)
     .run();
 }
 
 /**
  * The fields a template can reference. Kept deliberately small: every placeholder is a promise that
- * the value will be there, and plenty of contacts have nothing but a name. first_name is derived
- * rather than stored, because "Hi Jane" is what you write and "Hi Jane Smith" is what a machine
- * writes.
+ * the value will be there, and this app has 140 contacts with nothing but a name. first_name is
+ * derived rather than stored, because "Hi Jane" is what you write and "Hi Jane Smith" is
+ * what a machine writes.
  */
 export const PLACEHOLDERS = ["first_name", "full_name", "organization", "title"] as const;
 
@@ -151,16 +151,15 @@ app.get("/templates", async (c) => {
 
   /*
    * Resolving against a real contact is the point, so the picker is the same type-ahead pattern
-   * REL-024 settled on: a datalist over however many names rather than a select you have to scroll.
+   * REL-024 settled on: a datalist over 285 names rather than a select you have to scroll.
    *
    * TWO WAYS IN, matching what /audit already accepts (AUD-002). A name is what you type; an id is
-   * what a link carries. The id path was added because the contact record now links here.
+   * what a link carries. The id path was added 2026-08-01 because the contact record now links here.
    *
-   * CORRECTION. Earlier comments in this file — and the ambiguity message below — asserted that the
-   * database had two contacts sharing the same name. Checked against real data: no duplicate of any
-   * name actually existed at the time. The claim was never true and had been repeated as if it were. It
-   * is recorded here rather than quietly deleted, because a false fact that survived several readings is
-   * worth a note.
+   * CORRECTION, 2026-08-01. Earlier comments in this file — and the ambiguity message below — asserted
+   * that "this database has two contacts with the same name". Checked against production that day: 285 contacts, 285
+   * distinct names, no duplicate of any name, and exactly one contact of that name (id 240). The claim was never true and had been repeated as if it were. It is recorded here
+   * rather than quietly deleted, because a false fact that survived several readings is worth a note.
    *
    * The real reason to key links by id is not duplicates, which are possible but do not currently
    * exist. It is that full_name carries NO unique constraint (see the contact table) and IS editable
@@ -246,14 +245,17 @@ app.get("/templates", async (c) => {
   };
 
   return c.html(
-    layout({
+    layout({ c,
       title: "Message Templates",
       body: `<main>
   ${flash && flashMap[flash] ? `<div class="flash ${isWarn ? "warn" : "ok"}">${esc(flashMap[flash])}</div>` : ""}
   <h1>Message Templates</h1>
-  <p class="sub">${templates.length} template${templates.length === 1 ? "" : "s"} · <a href="/templates/new">new template</a> · ${
-        includeInactive ? '<a href="/templates">active only</a>' : '<a href="/templates?all=1">show inactive too</a>'
-      } · <a href="/">back to dashboard</a></p>
+  <p class="meta" style="margin:0 0 4px">${templates.length} template${templates.length === 1 ? "" : "s"}</p>
+  <div class="linkbar">
+    <a class="linkchip" href="/templates/new">New Template</a>
+    ${includeInactive ? '<a class="linkchip" href="/templates">Active Only</a>' : '<a class="linkchip" href="/templates?all=1">Show Inactive Too</a>'}
+    <a class="linkchip" href="/">Back to Dashboard</a>
+  </div>
 
   ${pickError ? `<div class="flash warn">${esc(pickError)}</div>` : ""}
 
@@ -325,7 +327,7 @@ function templateForm(t: Partial<MessageTemplate>, error?: string): string {
 </main>`;
 }
 
-app.get("/templates/new", (c) => c.html(layout({ title: "New Template", body: templateForm({}) })));
+app.get("/templates/new", (c) => c.html(layout({ c, title: "New Template", body: templateForm({}) })));
 
 app.post("/templates/new", async (c) => {
   const f = await c.req.parseBody();
@@ -349,7 +351,7 @@ app.get("/templates/:id/edit", async (c) => {
     .bind(Number(c.req.param("id")))
     .first<MessageTemplate>();
   if (!t) return c.notFound();
-  return c.html(layout({ title: `Edit ${t.name}`, body: templateForm(t) }));
+  return c.html(layout({ c, title: `Edit ${t.name}`, body: templateForm(t) }));
 });
 
 app.post("/templates/:id/edit", async (c) => {
@@ -361,7 +363,7 @@ app.post("/templates/:id/edit", async (c) => {
   const f = await c.req.parseBody();
   const name = str(f.name);
   const body = str(f.body);
-  if (!name || !body) return c.html(layout({ title: "Edit Template", body: templateForm({ ...before, id }, "A template needs both a name and a message.") }));
+  if (!name || !body) return c.html(layout({ c, title: "Edit Template", body: templateForm({ ...before, id }, "A template needs both a name and a message.") }));
 
   const rung = str(f.rung) ? Number(str(f.rung)) : null;
   const channel = str(f.channel) ?? "email";

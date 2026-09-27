@@ -4,10 +4,10 @@
 -- ---------------
 -- "Pray" is one of the outcome codes in the source spreadsheet's Priority column — definitions.md
 -- names them as CMPL, GHST, RTRD, Pray, NA — and it is the only one that never got a stage. A Pray row
--- imports today as an unrecognized code and lands in not_contacted, flagged on the preview. The operator
--- asked for the stage: "I may not use it much, but I want to have it."
+-- imports today as an unrecognized code and lands in not_contacted, flagged on the preview. The owner
+-- asked for the stage on 2026-08-04: "I may not use it much, but I want to have it."
 --
--- It is an ACTIVE stage (same decision), so it sits in ACTIVE_STAGES in types.ts and a contact
+-- It is an ACTIVE stage (his call, same day), so it sits in ACTIVE_STAGES in types.ts and a contact
 -- there with no follow-up date reaches Needs Attention. That matters more than it sounds: a stage in
 -- neither the active nor the terminal list appears in NO dashboard section, which is the invisible
 -- contact this app exists to prevent.

@@ -6,7 +6,7 @@
 // Every write records an audit event (AUD-001) with a real field-level diff (AUD-003).
 
 import { Hono } from "hono";
-import {
+import { PRIORITY_DEFAULT_CADENCE,
   DEPARTMENTS,
   DIRECTIONS,
   INTERACTION_TYPES,
@@ -31,11 +31,13 @@ import {
 } from "./types";
 import { isAttempt, reconcileAttemptLadder } from "./attempts";
 import { pursuitsForContact } from "./pursuits";
-import { esc, followUpPill, formatTime, layout, select } from "./views";
+import { esc, followUpPill, formatTime, initials, layout, priorityBadge, select, stageDotClass } from "./views";
 import { historyBlock, historyEntry } from "./history";
 import { contactActionBlock, contactActions, insertActionItem } from "./actions";
+import { commitmentBlock, listCommitments } from "./commitments";
+import { actor, isAdmin } from "./auth";
+import { activeOutreach, hasLiveSequence } from "./outreach";
 
-const ACTOR = "operator";
 /** How many interactions the contact record shows. Everything older lives on the full history page. */
 const RECENT_HISTORY = 5;
 const today = () => new Date().toISOString().slice(0, 10);
@@ -59,18 +61,18 @@ const plusDays = (n: number, from?: string) =>
 const notFuture = (d: string) => (d > today() ? today() : d);
 
 /*
- * RESOLVING next_follow_up WHEN A PARKING STAGE OR A CADENCE CHANGES (2026-08-18).
+ * RESOLVING next_follow_up WHEN A PARKING STAGE OR A CADENCE CHANGES (the owner, 2026-08-18).
  *
- * The report: moving a contact to Stay Connected and setting a connection range still left it showing
- * as overdue — updating the stage to Reach out later, Stay connected, Pray, or Complete needs to move
- * a stale follow-up date forward automatically rather than leaving it exactly where it was.
+ * The report: "With one contact, I moved him to Stay Connected and input a connection range; however,
+ * he is still showing as overdue… When I make an update to Reach out later, stay connected, pray, or
+ * complete, if there is a follow up date from a previous action, it needs to update automatically."
  *
  * WHY IT WAS BROKEN. The cadence (REL-027) only ever fired when an INTERACTION was recorded. Setting a
  * stage or an interval on the contact form wrote both values and left `next_follow_up` exactly as it was —
  * so a date left over from a previous action stayed put and stayed overdue.
  *
  * FIRING ON THE CADENCE CHANGE TOO IS LOAD-BEARING, and this is the part the literal request would have
- * missed. The actual sequence, recovered from one contact's real history:
+ * missed. His actual sequence on contact 20:
  *
  *     14:54:47  stage complete → stay_connected      (no interval set yet)
  *     14:55:47  touch_interval_days none → 180        (a SEPARATE save, stage unchanged)
@@ -79,7 +81,7 @@ const notFuture = (d: string) => (d > today() ? today() : d);
  * interval, and left the date alone — the bug would have survived the fix. Recovered from
  * contact_stage_event (migration 0020), which is the first thing that table has been useful for.
  *
- * THE RULES, decided 2026-08-18:
+ * THE RULES, each one the owner's decision 2026-08-18:
  *
  *   1. A DATE HE TYPED ALWAYS WINS. If the submitted follow-up differs from what was stored, that is a
  *      decision and nothing here touches it. Same principle the interaction form has always followed.
@@ -113,9 +115,8 @@ export function resolveFollowUpOnSave(opts: {
   const terminalStage = TERMINAL_STAGES.some((v) => v === opts.afterStage);
 
   /*
-   * RULE 5, added 2026-08-19 after this cost a batch of contacts their follow-up dates in one sitting.
-   * Erasing a populated date on a parking stage that HAS a cadence means "recompute it", not "leave me
-   * with nothing".
+   * RULE 5, added 2026-08-19 after this cost the owner 19 contacts. Erasing a populated date on a
+   * parking stage that HAS a cadence means "recompute it", not "leave me with nothing".
    *
    * Rule 1 below treats any submitted-vs-stored difference as a decision, and an erase is a
    * difference — so the blank was honoured and rules 2-4 never ran. Worse, no later save could
@@ -123,16 +124,15 @@ export function resolveFollowUpOnSave(opts: {
    * has moved. The contact sat with a cadence, no date, and dropped out of the follow-up list
    * entirely — quieter than the overdue state it replaced, and therefore worse.
    *
-   * In one short working session, cadences were set on nineteen contacts, clearing the stale date each
-   * time because the operator was the one who had typed it in the first place. Every single one saved
-   * blank. The natural reading of the field — "I deleted the date because I created it" — and the code
-   * disagreed with it.
+   * On 2026-08-19 between 14:53 and 15:09 the owner set cadences on 19 contacts, clearing the stale
+   * date each time because he was the one who had typed it. Every single one saved blank. His words:
+   * "The reason I deleted the next follow up date is because I created that date in the first place."
+   * That is the natural reading of the field and the code disagreed with it.
    *
    * Deliberately NOT extended to two neighbouring cases, because there an erase is a real decision:
    *   - a parking stage with NO cadence — a parked contact with no rhythm has no next step, and
    *     Needs Attention should say so (rule 4's reasoning, unchanged);
-   *   - a non-parking stage such as follow_up_action — that date is a commitment the operator owns
-   *     outright.
+   *   - a non-parking stage such as follow_up_action — that date is a commitment he owns outright.
    */
   const clearedByHand = !opts.submittedFollowUp && !!opts.storedFollowUp;
   const cadenceRecompute = clearedByHand && parking && !terminalStage && !!opts.afterInterval;
@@ -190,8 +190,8 @@ const RESOLUTION_ACTION_ROWS = 3;
 /**
  * One-click "come back to this person later" (REL-015).
  *
- * The interval is stored as an actual follow-up DATE, not encoded in the stage name. An earlier proposal
- * split the stage into "Reach Out Later 4 weeks" and "Reach Out Later 8 weeks" and suppressed
+ * The interval is stored as an actual follow-up DATE, not encoded in the stage name. The owner proposed
+ * splitting the stage into "Reach Out Later 4 weeks" and "Reach Out Later 8 weeks" and suppressing
  * those from Needs Attention until the interval elapsed. That would make the wake-up moment implicit
  * — derivable only from when the stage was last changed, which would need a new stage_changed_at
  * column and a second source of truth for when to act. An implicit date that exists only by
@@ -266,7 +266,7 @@ async function audit(
     .prepare(
       "INSERT INTO audit_event (actor, entity, entity_id, action, before_summary, after_summary, source, correlation_id) VALUES (?,?,?,?,?,?,'app',?)"
     )
-    .bind(ACTOR, entity, String(entityId), action, before ?? null, after, correlationId ?? null)
+    .bind(actor(), entity, String(entityId), action, before ?? null, after, correlationId ?? null)
     .run();
 }
 
@@ -359,11 +359,11 @@ function contactForm(opts: {
     : "";
   const datalist = `<datalist id="orgs">${opts.orgNames.map((n) => `<option value="${esc(n)}"></option>`).join("")}</datalist>`;
   /*
-   * Referral source (REL-005, #16). A type-ahead over names rather than a <select> listing every contact,
-   * which is the pattern REL-024 settled on for action items, and resolved server-side by exact name with
-   * an ambiguous name refused rather than guessed at (resolveReferrer below).
+   * Referral source (REL-005, #16). A type-ahead over names rather than a 285-option <select>, which is
+   * the pattern REL-024 settled on for action items, and resolved server-side by exact name with an
+   * ambiguous name refused rather than guessed at (resolveReferrer below).
    *
-   * Names, not ids, in the input: this is a field a person types into, and a person's name is what
+   * Names, not ids, in the input: this is a field a person types into, and "Jane Smith" is what
    * they know. That differs from the /templates and /audit links added in #59, which carry ids because a
    * link has no typist to disambiguate for it.
    */
@@ -413,6 +413,8 @@ function contactForm(opts: {
       <div><label>Stage</label>${select("stage", STAGES, c.stage ?? "not_contacted")}</div>
       <div><label>Relationship Strength</label>${select("strength", STRENGTHS, c.strength ?? null, { blank: "—" })}</div>
     </div>
+    <label class="check"><input type="checkbox" name="is_priority" value="1"${c.is_priority ? " checked" : ""}>
+      ★ Priority contact <span class="hint">— your inner circle; listed first in every dashboard work list, whatever the stage</span></label>
     <div class="row">
       <div><label>Referred By <span class="hint">optional — start typing the name of the contact who introduced you</span></label>
         <input type="text" name="referral_source" list="people" value="${esc(opts.referralName)}" placeholder="e.g. Jane Smith">${peopleList}</div>
@@ -511,14 +513,25 @@ async function orgNames(db: D1Db): Promise<string[]> {
   return results.map((r) => r.name);
 }
 
-app.get("/contacts/new", async (c) =>
-  c.html(
-    layout({
+/**
+ * `email`/`name` prefill the blank form (the owner, 2026-09-22) — used by /email/import's "No matching
+ * contact" list so adding someone spotted in a week's mail doesn't mean retyping their address by hand.
+ * Not otherwise validated here: the form's own save-time checks (and duplicate detection) still apply.
+ */
+app.get("/contacts/new", async (c) => {
+  const email = str(c.req.query("email"));
+  const name = str(c.req.query("name"));
+  return c.html(
+    layout({ c,
       title: "Add Contact",
-      body: contactForm({ orgNames: await orgNames(c.env.DB), people: await people(c.env.DB) }),
+      body: contactForm({
+        contact: email || name ? { email_work: email, full_name: name ?? undefined } : undefined,
+        orgNames: await orgNames(c.env.DB),
+        people: await people(c.env.DB),
+      }),
     })
-  )
-);
+  );
+});
 
 interface ParsedForm {
   full_name: string | null;
@@ -532,6 +545,8 @@ interface ParsedForm {
   linkedin_url: string | null;
   /** REL-011. A checkbox, so absent from the body means unticked — there is no "unchanged" state. */
   no_linkedin: boolean;
+  /** Migration 0029. A checkbox, same absent-means-unticked rule as no_linkedin. */
+  is_priority: boolean;
   /** REL-027. Blank means no cadence; the string is validated in validate(). */
   touch_interval_days: string | null;
   birthday: string | null;
@@ -560,6 +575,7 @@ async function parseContactForm(c: { req: { parseBody(): Promise<Record<string, 
     phone: str(f.phone),
     linkedin_url: str(f.linkedin_url),
     no_linkedin: f.no_linkedin === "1",
+    is_priority: f.is_priority === "1",
     touch_interval_days: str(f.touch_interval_days),
     birthday: str(f.birthday),
     stage: str(f.stage) ?? "not_contacted",
@@ -578,7 +594,7 @@ async function parseContactForm(c: { req: { parseBody(): Promise<Record<string, 
 /**
  * Validation is deliberately minimal: only the name is required. A missing follow-up date on an
  * active-stage contact is surfaced on the dashboard (“Needs Attention”) rather than blocking the
- * save — changed 2026-07-30 after the block got in the way of real use.
+ * save — changed 2026-07-30 after the owner pointed out the block got in the way.
  *
  * The one structural rule enforced here: stage and meeting date must agree, in BOTH directions.
  *
@@ -586,19 +602,19 @@ async function parseContactForm(c: { req: { parseBody(): Promise<Record<string, 
  * no next step, which is precisely how one went missing.
  *
  * And a meeting date requires the stage to be Meeting Scheduled. That half was missing until
- * 2026-08-03, and it let a record hold two facts that contradict each other: a meeting invite came in,
- * the meeting date was added for the next day, and the contact stayed in Chase Non-Responders —
- * because chaseList() selects on `stage='awaiting_response'` and nothing had moved the stage. The
- * record simultaneously said "a meeting is booked for tomorrow" and "they have never replied".
+ * 2026-08-03, and it let a record hold two facts that contradict each other. The owner got an invite from
+ * a contact (id 46), added the meeting for the next day, and the contact stayed in Chase
+ * Non-Responders — because chaseList() selects on `stage='awaiting_response'` and nothing had moved the
+ * stage. The record simultaneously said "a meeting is booked for tomorrow" and "he has never replied".
  *
  * Refused rather than auto-corrected. Quietly rewriting a stage the user did not touch is the same
  * class of move as a silent import default, and this codebase does not make it — the reason a contact
  * is in a stage should always be that someone put it there. The message names both facts and both ways
  * out, so the refusal costs one click either way.
  *
- * Note this will refuse the next edit of any record already in the contradictory state. A handful
- * existed as of 2026-08-03, each in_conversation with a booked meeting. That is the rule working: they
- * are wrong now and nothing would otherwise tell anyone.
+ * Note this will refuse the next edit of any record already in the contradictory state. Two exist as
+ * of 2026-08-03 — two contacts (239 and 245), both in_conversation with a booked meeting.
+ * That is the rule working: they are wrong now and nothing would otherwise tell anyone.
  */
 function validate(form: ParsedForm): string | null {
   if (!form.full_name) return "A full name is required.";
@@ -624,12 +640,23 @@ function validate(form: ParsedForm): string | null {
   return null;
 }
 
+/**
+ * Newly flagged ★ Priority with no cadence? Give it the default (PRIORITY_DEFAULT_CADENCE). Applied
+ * before validation and before resolveFollowUpOnSave, so the interval change is audited like any other
+ * and a parking stage gets its follow-up date from it on the same save.
+ */
+export function applyPriorityCadenceDefault(form: ParsedForm, before?: { is_priority?: number; touch_interval_days?: number | null }) {
+  if (form.is_priority && !before?.is_priority && !form.touch_interval_days && !before?.touch_interval_days)
+    form.touch_interval_days = String(PRIORITY_DEFAULT_CADENCE);
+}
+
 app.post("/contacts/new", async (c) => {
   const form = await parseContactForm(c);
+  applyPriorityCadenceDefault(form);
   const error = validate(form);
   const renderBack = async (extra: { error?: string; duplicates?: Contact[]; confirmToken?: boolean }) =>
     c.html(
-      layout({
+      layout({ c,
         title: "Add Contact",
         body: contactForm({
           orgNames: await orgNames(c.env.DB),
@@ -642,6 +669,7 @@ app.post("/contacts/new", async (c) => {
             priority_tier: form.priority_tier ? Number(form.priority_tier) : null,
             // The form carries this as a checkbox boolean; Contact carries the integer SQLite stores.
             no_linkedin: form.no_linkedin ? 1 : 0,
+            is_priority: form.is_priority ? 1 : 0,
             touch_interval_days: form.touch_interval_days ? Number(form.touch_interval_days) : null,
           },
           ...extra,
@@ -670,8 +698,8 @@ app.post("/contacts/new", async (c) => {
   const inserted = await c.env.DB.prepare(
     `INSERT INTO contact (full_name, title, organization_id, department, email_work, email_personal, phone,
       linkedin_url, no_linkedin, birthday, stage, strength, priority_tier, last_touch, next_follow_up, meeting_date,
-      meeting_time, notes, referral_source_contact_id, touch_interval_days, source, status)
-     VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,'manual','active')`
+      meeting_time, notes, referral_source_contact_id, touch_interval_days, is_priority, source, status)
+     VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,'manual','active')`
   )
     .bind(
       form.full_name,
@@ -693,7 +721,8 @@ app.post("/contacts/new", async (c) => {
       form.meeting_time,
       form.notes,
       referrer.id,
-      form.touch_interval_days ? Number(form.touch_interval_days) : null
+      form.touch_interval_days ? Number(form.touch_interval_days) : null,
+      form.is_priority ? 1 : 0
     )
     .run();
   /*
@@ -725,7 +754,7 @@ app.get("/contacts/:id/edit", async (c) => {
     .first<Contact>();
   if (!contact) return c.notFound();
   return c.html(
-    layout({
+    layout({ c,
       title: `Edit ${contact.full_name}`,
       body: contactForm({
         contact,
@@ -742,12 +771,13 @@ app.post("/contacts/:id/edit", async (c) => {
   const before = await c.env.DB.prepare("SELECT * FROM contact WHERE id = ?").bind(id).first<Contact>();
   if (!before) return c.notFound();
   const form = await parseContactForm(c);
+  applyPriorityCadenceDefault(form, before);
   const error = validate(form);
   const referrer = error ? null : await resolveReferrer(c.env.DB, form.referral_source, id);
   const referralError = referrer && "error" in referrer ? referrer.error : null;
   if (error || referralError) {
     return c.html(
-      layout({
+      layout({ c,
         title: "Edit Contact",
         body: contactForm({
           orgNames: await orgNames(c.env.DB),
@@ -761,6 +791,7 @@ app.post("/contacts/:id/edit", async (c) => {
             organization_name: form.organization,
             priority_tier: form.priority_tier ? Number(form.priority_tier) : null,
             no_linkedin: form.no_linkedin ? 1 : 0,
+            is_priority: form.is_priority ? 1 : 0,
             touch_interval_days: form.touch_interval_days ? Number(form.touch_interval_days) : null,
           },
           error: error ?? referralError ?? undefined,
@@ -790,11 +821,17 @@ app.post("/contacts/:id/edit", async (c) => {
   });
   const nextFollowUpToWrite =
     resolvedFollowUp === undefined ? form.next_follow_up : resolvedFollowUp;
+  const meetingEditedByHand =
+    (form.meeting_date ?? null) !== (before.meeting_date ?? null) ||
+    (form.meeting_time ?? null) !== (before.meeting_time ?? null);
 
   await c.env.DB.prepare(
     `UPDATE contact SET full_name=?, title=?, organization_id=?, department=?, email_work=?, email_personal=?,
       phone=?, linkedin_url=?, no_linkedin=?, birthday=?, stage=?, strength=?, priority_tier=?, last_touch=?, next_follow_up=?,
       meeting_date=?, meeting_time=?, notes=?, status=?, referral_source_contact_id=?, touch_interval_days=?,
+      is_priority=?,
+      meeting_event_dismissed = CASE WHEN ? THEN COALESCE(meeting_event_id, meeting_event_dismissed) ELSE meeting_event_dismissed END,
+      meeting_event_id = CASE WHEN ? THEN NULL ELSE meeting_event_id END,
       updated_at=datetime('now') WHERE id=?`
   )
     .bind(
@@ -819,6 +856,11 @@ app.post("/contacts/:id/edit", async (c) => {
       form.status,
       referrerId,
       form.touch_interval_days ? Number(form.touch_interval_days) : null,
+      form.is_priority ? 1 : 0,
+      // Migration 0030: editing the meeting by hand makes it his again — the calendar sync stops
+      // following that event, and will not re-link it.
+      meetingEditedByHand ? 1 : 0,
+      meetingEditedByHand ? 1 : 0,
       id
     )
     .run();
@@ -837,6 +879,7 @@ app.post("/contacts/:id/edit", async (c) => {
       // Rendered as words rather than 1/0: "no_linkedin no → yes" is a sentence in the audit trail,
       // and fieldDiff treats 0 as a value rather than as absent, so a bare number would read "0 → 1".
       no_linkedin: before.no_linkedin ? "yes" : "no",
+      is_priority: before.is_priority ? "yes" : "no",
       birthday: before.birthday,
       department: before.department,
       last_touch: before.last_touch,
@@ -859,6 +902,7 @@ app.post("/contacts/:id/edit", async (c) => {
       phone: form.phone,
       linkedin_url: form.linkedin_url,
       no_linkedin: form.no_linkedin ? "yes" : "no",
+      is_priority: form.is_priority ? "yes" : "no",
       birthday: form.birthday,
       department: form.department,
       last_touch: lastTouch,
@@ -887,15 +931,15 @@ app.post("/contacts/:id/edit", async (c) => {
  * THE INTERVAL ALSO BECOMES THE CADENCE WHEN THERE ISN'T ONE (REL-029, 2026-08-19).
  *
  * Until this, the action set a date and nothing else, so "reach out in 3 months" was a single alarm:
- * the date arrived, the contact went overdue, and the same number had to be typed again. Used on a
- * handful of contacts, it produced exactly that: they wouldn't come back round on their own, and a
- * larger check of Reach Out Later contacts found many carrying a date with no rhythm behind it. The
- * control reads like it is setting a rhythm, so it now sets one.
+ * the date arrived, the contact went overdue, and the same number had to be typed again. On
+ * 2026-08-19 the owner used it on four contacts and asked why they still wouldn't come back round —
+ * and 33 Reach Out Later contacts were carrying a date with no rhythm behind it. The control reads
+ * like it is setting a rhythm, so it now sets one.
  *
- * ONLY WHEN THE FIELD IS EMPTY. An existing cadence is the operator's considered rhythm for that
- * person; a one-click "come back in 4 weeks" is a nudge about right now, and letting the nudge
- * overwrite the rhythm would be the silent class of change this codebase refuses. So a contact on 180
- * days who gets a 4-week nudge keeps 180 days and simply wakes up sooner this once.
+ * ONLY WHEN THE FIELD IS EMPTY. An existing cadence is his considered rhythm for that person; a
+ * one-click "come back in 4 weeks" is a nudge about right now, and letting the nudge overwrite the
+ * rhythm would be the silent class of change this codebase refuses. So a contact on 180 days who
+ * gets a 4-week nudge keeps 180 days and simply wakes up sooner this once.
  *
  * MAX_REACH_OUT_DAYS (730) is below MAX_TOUCH_INTERVAL_DAYS (1095), so any value that passes the
  * check above is a legal cadence. Asserted here rather than assumed, because the two constants are
@@ -954,7 +998,7 @@ app.get("/contacts/:id/history", async (c) => {
     .all<Interaction>();
 
   return c.html(
-    layout({
+    layout({ c,
       title: `History · ${contact.full_name}`,
       body: `<main>
   <h1>Interaction History</h1>
@@ -987,7 +1031,7 @@ function interactionForm(opts: {
   resolveMeeting?: string;
   /**
    * The meeting currently on this contact's calendar, when there is one and we are not already
-   * resolving it. Drives the inline resolution offer below (added 2026-08-11).
+   * resolving it. Drives the inline resolution offer below (the owner, 2026-08-11).
    */
   bookedMeeting?: { date: string; time: string | null };
   /** The contact's cadence today, shown so the field can say what it would be changing. */
@@ -1025,7 +1069,7 @@ function interactionForm(opts: {
         <div><label>OneNote Link <span class="hint">paste “Copy Link to Page”</span></label><input type="url" name="notes_link"></div>
         ${/*
           The `required` attribute that used to sit on this field when resolving a meeting is GONE
-          (2026-08-11) — a stage of Complete needs to be saveable without a follow-up date.
+          (the owner, 2026-08-11: "I need to be able to save a complete stage without a follow up date").
           It was a browser-side rule that could not see which stage had been chosen, so resolving a
           meeting to Complete was refused before the request was ever sent — while the SERVER, which
           has always exempted the terminal stages a few lines into the POST handler, would have saved
@@ -1048,9 +1092,10 @@ function interactionForm(opts: {
         <div><label>Outcome</label><input type="text" name="outcome" value="${esc(p.outcome)}" placeholder="optional"></div>
       </div>
       ${/*
-        TOUCH EVERY, ON THIS FORM (REL-034, 2026-08-25).
-        The reported gap: changing the status to Stay Connected on an interaction meant a second trip to
-        the person's record just to set the touch-every-day amount, with no way to do both at once.
+        TOUCH EVERY, ON THIS FORM (REL-034, the owner 2026-08-25).
+        "If I change the status to stay connected in the interaction, I have to go into the person's
+        record to set the touch-every-day amount. Is there any way I can just put that on the
+        interaction?"
 
         The gap was real and narrow: Move Stage To could park someone in Stay Connected right here, but
         the rhythm that makes that stage mean anything lived on another screen. So the one decision
@@ -1080,8 +1125,8 @@ function interactionForm(opts: {
       </div>
       ${
         /*
-         * RESOLVE THE BOOKED MEETING WITHOUT LEAVING THIS FORM (2026-08-11) — the two-screen path below
-         * needed streamlining.
+         * RESOLVE THE BOOKED MEETING WITHOUT LEAVING THIS FORM (the owner, 2026-08-11: "I need to
+         * streamline that").
          *
          * The friction being removed, reproduced end to end on 2026-08-11: setting Move Stage To on this
          * form while a meeting was still on the calendar recorded the interaction and SILENTLY DROPPED
@@ -1201,6 +1246,9 @@ app.get("/contacts/:id", async (c) => {
   // itself, and truncating the one list that says what you owe would defeat the point.
   const actionItems = await contactActions(c.env.DB, id);
   const openActions = actionItems.filter((a) => !a.done).length;
+  // Sales commitments (0035) are admin-only, like /commitments itself, whose routes the section posts to.
+  const commitments = isAdmin() ? await listCommitments(c.env.DB, { contactId: id, includeClosed: true }) : null;
+  const openCommitments = commitments?.filter((m) => m.status === "open").length ?? 0;
 
   /** The work this person is named on (PURS-001) — see the note beside the section that renders it. */
   const pursuits = await pursuitsForContact(c.env.DB, id);
@@ -1245,6 +1293,7 @@ app.get("/contacts/:id", async (c) => {
       "This contact has a meeting scheduled. Resolve the meeting first — Held, No-Show, or Cancelled — then set a reach-out-later date.",
     badinterval: "That reach-out-later interval was not valid, so nothing changed.",
     badcadence: `“Touch Every” must be a whole number of days between 1 and ${MAX_TOUCH_INTERVAL_DAYS}, or blank to leave the cadence as it is. Nothing was saved — the interaction was not recorded either, so re-enter it.`,
+    editbadcadence: `“Touch Every” must be a whole number of days between 1 and ${MAX_TOUCH_INTERVAL_DAYS}, or blank to leave the cadence as it is. Nothing was saved.`,
     actionadded: "Action item added.",
     actiondone: "Marked done.",
     actionreopened: "Reopened.",
@@ -1287,6 +1336,21 @@ app.get("/contacts/:id", async (c) => {
       }
     : undefined;
 
+  // + Outreach in the header (Phase 2a), admins only: queue this person, or see that they're queued/drafted.
+  const outreachStatus = isAdmin() ? (await activeOutreach(c.env.DB)).get(contact.id) ?? "" : null;
+  // Phase 2b: a live follow-up sequence can be stopped from here too.
+  const stopFollowUps =
+    outreachStatus !== null && (await hasLiveSequence(c.env.DB, contact.id))
+      ? `<form method="post" action="/outreach/followups/${contact.id}/stop" style="display:inline"><input type="hidden" name="return" value="/contacts/${contact.id}"><button type="submit" class="secondary" title="No more follow-up drafts for this outreach">Stop Follow-ups</button></form>`
+      : "";
+  const outreachButton =
+    stopFollowUps +
+    (outreachStatus === null
+      ? ""
+      : outreachStatus === "drafted"
+        ? `<a class="btn secondary" href="/outreach">Draft Ready</a>`
+        : `<form method="post" action="/outreach/toggle/${contact.id}" style="display:inline"><input type="hidden" name="source" value="contact"><input type="hidden" name="return" value="/contacts/${contact.id}"><button type="submit" class="secondary" aria-pressed="${outreachStatus ? "true" : "false"}">${outreachStatus ? "Queued ✓" : "+ Outreach"}</button></form>`);
+
   const meetingPanel = contact.meeting_date
     ? `<section>
     <h2>Scheduled Meeting</h2>
@@ -1322,7 +1386,7 @@ app.get("/contacts/:id", async (c) => {
     </div>`;
 
   return c.html(
-    layout({
+    layout({ c,
       title: contact.full_name,
       body: `<main>
   ${flashHtml}
@@ -1335,25 +1399,34 @@ app.get("/contacts/:id", async (c) => {
         }</div>`
       : ""
   }
-  <h1>${esc(contact.full_name)}</h1>
   ${/* The company name is now a link (ORG-001) — the address, industry and notes live there, and until
        today there was nowhere to click through to. */ ""}
-  <p class="sub">${esc(contact.title ?? "")}${contact.title && contact.organization_name ? " · " : ""}${
-    contact.organization_id && contact.organization_name
-      ? `<a href="/organizations/${contact.organization_id}/edit">${esc(contact.organization_name)}</a>`
-      : esc(contact.organization_name ?? "")
-  }</p>
-
   <!--
-    Phone only (UX-001, #56). Logging a note in the car straight after a meeting is the highest-value
-    mobile flow in the app — capture at the moment of memory rather than hours later, which is the
-    failure this platform exists to prevent. On a phone the form sits at the very bottom, below the
-    relationship fields, the action items and the history, so reaching it means a long scroll one-handed.
-    This is an anchor to the form that is already there rather than a second form: one link, no new write
-    path, nothing to keep in sync. Hidden on desktop, where the form is a short scroll away and the extra
-    button would be clutter.
+    Identity header (Phase 4, 2026-09-14). Replaces the bare <h1>+.sub with the shared .chead bar so
+    this page picks up the same avatar/stage-dot vocabulary the dashboard and contacts list already
+    have. "Log Interaction" replaces the old phone-only jump link (UX-001, #56) with an always-visible
+    button — the anchor target (#record) and the form itself are unchanged, this just makes the jump
+    reachable on desktop too instead of only under 640px.
   -->
-  <p class="phone-only"><a class="btn" href="#record">Record an interaction ↓</a></p>
+  <div class="chead">
+    <div class="chead-id">
+      <span class="avatar lg">${esc(initials(contact.full_name))}</span>
+      <div>
+        <div class="chead-name">${esc(contact.full_name)} ${priorityBadge(contact)}</div>
+        <div class="chead-sub">${esc(contact.title ?? "")}${contact.title && contact.organization_name ? " · " : ""}${
+          contact.organization_id && contact.organization_name
+            ? `<a href="/organizations/${contact.organization_id}/edit">${esc(contact.organization_name)}</a>`
+            : esc(contact.organization_name ?? "")
+        }</div>
+      </div>
+      <span class="stagewrap"><span class="dot ${stageDotClass(contact.stage)}"></span>${esc(stageLabel(contact.stage))}</span>
+    </div>
+    <div class="chead-acts">
+      ${outreachButton}
+      <a class="btn secondary" href="/contacts/${contact.id}/edit">Edit</a>
+      <a class="btn" href="#record">Log Interaction</a>
+    </div>
+  </div>
 
   ${meetingPanel}
 
@@ -1366,7 +1439,7 @@ app.get("/contacts/:id", async (c) => {
           : ""
       }</dd>
       <dt>Strength</dt><dd>${esc(labelFor(STRENGTHS, contact.strength))}</dd>
-      <dt>Meeting</dt><dd>${contact.meeting_date ? `${esc(contact.meeting_date)}${contact.meeting_time ? ` at ${esc(contact.meeting_time)}` : ""}` : "—"}</dd>
+      <dt>Meeting</dt><dd class="mono">${contact.meeting_date ? `${esc(contact.meeting_date)}${contact.meeting_time ? ` at ${esc(contact.meeting_time)}` : ""}` : "—"}</dd>
       <dt>Next Follow-Up</dt><dd>${followUpPill(contact.next_follow_up, contact.stage)}${
         contact.touch_interval_days
           ? ` <span class="meta">then every ${esc(contact.touch_interval_days)} days</span>`
@@ -1378,7 +1451,7 @@ app.get("/contacts/:id", async (c) => {
           ? `every ${esc(contact.touch_interval_days)} days <span class="meta">— set when you record an interaction</span>`
           : '— <span class="meta">no cadence</span>'
       }</dd>
-      <dt>Last Touch</dt><dd>${esc(contact.last_touch ?? "—")}</dd>
+      <dt>Last Touch</dt><dd class="mono">${esc(contact.last_touch ?? "—")}</dd>
       <dt>Work Email</dt><dd>${contact.email_work ? `<a href="mailto:${esc(contact.email_work)}">${esc(contact.email_work)}</a>` : "—"}</dd>
       <dt>Personal Email</dt><dd>${contact.email_personal ? `<a href="mailto:${esc(contact.email_personal)}">${esc(contact.email_personal)}</a>` : "—"}</dd>
       <dt>Phone</dt><dd>${esc(contact.phone ?? "—")}</dd>
@@ -1391,7 +1464,7 @@ app.get("/contacts/:id", async (c) => {
               '<span class="pill grey">no profile</span> <span class="meta">marked as not on LinkedIn</span>'
             : `— <span class="meta"><a href="/linkedin">find it</a></span>`
       }</dd>
-      <dt>Birthday</dt><dd>${esc(contact.birthday ?? "—")}</dd>
+      <dt>Birthday</dt><dd class="mono">${esc(contact.birthday ?? "—")}</dd>
       <dt>Department</dt><dd>${esc(contact.department ?? "—")}</dd>
       <dt>Priority Tier</dt><dd>${esc(contact.priority_tier ?? "—")}</dd>
       <dt>Referred By</dt><dd>${
@@ -1405,17 +1478,16 @@ app.get("/contacts/:id", async (c) => {
       The two links deferred out of REL-008 Part A and AUD-002. Both destinations already take the
       contact as a query parameter, so this is a link rather than a new route.
 
-      Both are keyed by id. Not because names collide today — production was checked and every contact
-      has a distinct name — but because full_name has no unique constraint and is
+      Both are keyed by id. Not because names collide today — production was checked on 2026-08-01 and
+      has 285 contacts with 285 distinct names — but because full_name has no unique constraint and is
       editable from the Edit Contact form beside these links. A name-keyed link would break silently
       the first time a name is corrected. An id cannot go stale that way.
 
-      (An earlier version of this comment justified the choice by claiming the database has two contacts
-      with the same name. It does not, and never did; the claim was inherited from templates.ts and
-      repeated without checking. Corrected in the same breath as fixing it there.)
+      (An earlier version of this comment justified the choice by claiming the database has two John
+      Joneses. It does not, and never did; the claim was inherited from templates.ts and repeated
+      without checking. Corrected in the same breath as fixing it there.)
     */ ""}
     <div class="actions">
-      <a class="btn secondary" href="/contacts/${contact.id}/edit">Edit Contact</a>
       <a class="btn secondary" href="/templates?contact=${contact.id}">Message Templates</a>
       <a class="btn secondary" href="/audit?contact=${contact.id}">Audit Trail</a>
     </div>
@@ -1426,26 +1498,29 @@ app.get("/contacts/:id", async (c) => {
     referred.length
       ? `<section>
     <h2>Referrals Made (${referred.length})</h2>
-    <table><tbody>${referred
+    <div class="list">${referred
       .map(
-        (k) => `<tr>
-        <td><a href="/contacts/${k.id}"><b>${esc(k.full_name)}</b></a>${
-          k.organization_name ? `<div class="meta">${esc(k.organization_name)}</div>` : ""
-        }</td>
-        <td><span class="pill grey">${esc(stageLabel(k.stage))}</span>${
-          k.status === "inactive" ? ' <span class="pill">inactive</span>' : ""
-        }</td>
-      </tr>`
+        (k) => `<div class="listrow">
+        <span class="avatar">${esc(initials(k.full_name))}</span>
+        <div class="listrow-main">
+          <div class="listrow-name"><a href="/contacts/${k.id}">${esc(k.full_name)}</a></div>
+          ${k.organization_name ? `<div class="meta">${esc(k.organization_name)}</div>` : ""}
+        </div>
+        <div class="listrow-meta">
+          <span class="stagewrap"><span class="dot ${stageDotClass(k.stage)}"></span>${esc(stageLabel(k.stage))}</span>
+          ${k.status === "inactive" ? '<span class="pill grey">inactive</span>' : ""}
+        </div>
+      </div>`
       )
-      .join("")}</tbody></table>
+      .join("")}</div>
     <p class="meta" style="margin-top:8px">People ${esc(contact.full_name)} introduced you to. <a href="/referrals">All referral sources</a>.</p>
   </section>`
       : ""
   }
 
   ${/*
-    PURSUITS THIS PERSON IS NAMED ON (PURS-001). The motivating question was whether there were others
-    being missed, buried in a person's record — the answer once before was action items, and the same
+    PURSUITS THIS PERSON IS NAMED ON (PURS-001). The owner's question in August was "are there any others
+    that I'm missing, buried in a person's record?" — the answer then was action items, and the same
     failure was about to be built again: a role on a pursuit would have been visible only from the
     pursuit. Being named as a decision maker is a fact about the relationship, so it belongs on the
     relationship.
@@ -1454,17 +1529,20 @@ app.get("/contacts/:id", async (c) => {
     pursuits.length
       ? `<section>
     <h2>Pursuits (${pursuits.length})</h2>
-    <table><thead><tr><th>Pursuit</th><th>Their role</th><th>Status</th></tr></thead><tbody>${pursuits
+    <div class="list">${pursuits
       .map(
-        (p) => `<tr>
-        <td><a href="/engagements/${p.id}/edit"><b>${esc(p.name)}</b></a>${
-          p.organization_name ? `<div class="meta">${esc(p.organization_name)}</div>` : ""
-        }</td>
-        <td data-label="Their role">${esc(labelFor(PURSUIT_ROLES, p.role))}</td>
-        <td data-label="Status"><span class="pill grey">${esc(labelFor(ENGAGEMENT_STATUSES, p.status))}</span></td>
-      </tr>`
+        (p) => `<div class="listrow">
+        <div class="listrow-main">
+          <div class="listrow-name"><a href="/engagements/${p.id}/edit">${esc(p.name)}</a></div>
+          ${p.organization_name ? `<div class="meta">${esc(p.organization_name)}</div>` : ""}
+        </div>
+        <div class="listrow-meta">
+          <span class="meta">${esc(labelFor(PURSUIT_ROLES, p.role))}</span>
+          <span class="pill grey">${esc(labelFor(ENGAGEMENT_STATUSES, p.status))}</span>
+        </div>
+      </div>`
       )
-      .join("")}</tbody></table>
+      .join("")}</div>
     <p class="meta" style="margin-top:8px">Work ${esc(contact.full_name)} is named on. <a href="/pursuits">The whole pipeline</a>.</p>
   </section>`
       : ""
@@ -1474,6 +1552,15 @@ app.get("/contacts/:id", async (c) => {
     <h2>Action Items${openActions ? ` (${openActions} open)` : ""}</h2>
     ${contactActionBlock(contact.id, actionItems)}
   </section>
+${
+  commitments
+    ? `
+  <section id="commitments">
+    <h2>Sales Commitments${openCommitments ? ` (${openCommitments} open)` : ""}</h2>
+    ${commitmentBlock({ contactId: contact.id }, commitments)}
+  </section>`
+    : ""
+}
 
   <section>
     <h2>History (${totalInteractions})</h2>
@@ -1506,7 +1593,7 @@ app.post("/contacts/:id/interactions", async (c) => {
   // attempt (#82) depends on it.
   const direction = str(f.direction);
   /*
-   * Two ways in, one code path (2026-08-11).
+   * Two ways in, one code path (the owner, 2026-08-11).
    *
    * `resolve_meeting` is the dedicated resolution form, reached from the dashboard meeting rows.
    * `clear_meeting` is the checkbox now offered on the ordinary record-page form when a meeting is
@@ -1548,10 +1635,10 @@ app.post("/contacts/:id/interactions", async (c) => {
   }
   /*
    * The other way a contact ends up holding two contradictory facts (found 2026-08-03 alongside the
-   * meeting/stage report above). "Stage This Moved To" will happily move a contact off meeting_scheduled
+   * report above). "Stage This Moved To" will happily move a contact off meeting_scheduled
    * while a meeting_date is still set, because meeting_date is only cleared when resolve_meeting is
    * present. The result is a booked meeting on a stage that says no meeting is booked — which is the
-   * state a couple of real contacts were found to be in, and this is almost certainly how they got
+   * state two contacts (239 and 245) are in, and this is almost certainly how they got
    * there. The form-level rule in validate() cannot see this path; it has to be caught here.
    *
    * The interaction is still recorded — refusing the whole save would throw away what the user typed,
@@ -1655,19 +1742,23 @@ app.post("/contacts/:id/interactions", async (c) => {
          touch_interval_days = COALESCE(?, touch_interval_days),
          meeting_date = CASE WHEN ? IS NOT NULL THEN NULL ELSE meeting_date END,
          meeting_time = CASE WHEN ? IS NOT NULL THEN NULL ELSE meeting_time END,
+         -- Migration 0030: a resolved meeting's Outlook event is remembered as dealt with, so the hourly
+         -- calendar sync cannot put it back (a Cancelled meeting whose invite was never withdrawn).
+         meeting_event_dismissed = CASE WHEN ? IS NOT NULL AND meeting_event_id IS NOT NULL THEN meeting_event_id ELSE meeting_event_dismissed END,
+         meeting_event_id = CASE WHEN ? IS NOT NULL THEN NULL ELSE meeting_event_id END,
          updated_at = datetime('now')
        WHERE id = ?`
     )
-    .bind(nextFollowUp, newStage, newInterval, resolveMeeting, resolveMeeting, id)
+    .bind(nextFollowUp, newStage, newInterval, resolveMeeting, resolveMeeting, resolveMeeting, resolveMeeting, id)
     .run();
 
   /*
    * An outreach recorded here is an attempt, and the ladder has to know (#82).
    *
    * Before this, `last_attempt_at` and `escalation_rung` were maintained ONLY by the dashboard chase
-   * buttons, so an email logged on this form was invisible to the chase list. An outbound email
-   * recorded here, on 2026-08-04, produced a chase list that said "no attempt recorded" while the same
-   * row said "1 attempt · tried email" — and sorted that contact above people never contacted at all.
+   * buttons, so an email logged on this form was invisible to the chase list. The owner emailed Tracey
+   * Spivey (377) on 2026-08-04, recorded it here, and the chase list said "no attempt recorded" while
+   * the same row said "1 attempt · tried email" — and sorted him above people never contacted at all.
    * Which form recorded the outreach is an implementation detail; whether the outreach happened is not.
    *
    * The definition lives in attempts.ts and is shared with the query that draws the count, so the two
@@ -1679,8 +1770,8 @@ app.post("/contacts/:id/interactions", async (c) => {
    * did happen, it is simply not the most recent one.
    *
    * NEXT_FOLLOW_UP IS DELIBERATELY NOT TOUCHED, which is the one place this differs from the chase
-   * button. That button owns the whole decision, so it sets a date three business days out (2026-08-04).
-   * This form has a "Set Next Follow-Up" field on screen, and overwriting what the operator
+   * button. That button owns the whole decision, so it sets a date three business days out (the owner,
+   * 2026-08-04). This form has a "Set Next Follow-Up" field on screen, and overwriting what the operator
    * typed — or filling in a date they deliberately left empty — would make the form lie about what it
    * saved. The field is the decision here.
    */
@@ -1772,7 +1863,7 @@ app.post("/contacts/:id/interactions", async (c) => {
    * dashboard to hint at.
    */
   /*
-   * …but only when the stage it landed on actually says the next move is yours (2026-08-11).
+   * …but only when the stage it landed on actually says the next move is yours (the owner, 2026-08-11).
    *
    * This used to fire on any Held resolution, and its wording — "The stage now says the next move is
    * yours, but nothing was named" — is a sentence about follow_up_action specifically. Resolving to
@@ -1780,7 +1871,7 @@ app.post("/contacts/:id/interactions", async (c) => {
    * Conversation produced it about a stage that makes no claim either way. Held only DEFAULTS to
    * follow_up_action (RESOLUTION_STAGE), and the operator is free to pick something else, so the test
    * has to be the stage that landed rather than the outcome that was chosen. Terminal stages fall out
-   * of this for free, which is what was reported.
+   * of this for free, which is what the owner reported.
    */
   if (resolveMeeting === "held" && !createdActions && landingStage === "follow_up_action")
     return c.redirect(`/contacts/${id}?flash=resolvednoitems#actions`);
@@ -1793,9 +1884,9 @@ app.get("/interactions/:id/edit", async (c) => {
   const iid = Number(c.req.param("id"));
   const i = await c.env.DB.prepare("SELECT * FROM interaction WHERE id = ?").bind(iid).first<Interaction>();
   if (!i) return c.notFound();
-  const contact = await c.env.DB.prepare("SELECT id, full_name, stage FROM contact WHERE id = ?")
+  const contact = await c.env.DB.prepare("SELECT id, full_name, stage, touch_interval_days FROM contact WHERE id = ?")
     .bind(i.contact_id)
-    .first<{ id: number; full_name: string; stage: string }>();
+    .first<{ id: number; full_name: string; stage: string; touch_interval_days: number | null }>();
   if (!contact) return c.notFound();
 
   // Editing history does not silently rewrite the contact's current state — but when the two disagree
@@ -1803,15 +1894,14 @@ app.get("/interactions/:id/edit", async (c) => {
   // interaction could claim it moved the contact to a stage the contact was never moved to.
   const stageDivergence =
     i.stage_moved_to && i.stage_moved_to !== contact.stage
-      ? // "the box below" was well over a screen's worth of markup below this banner — eight fields, and
-        // on a phone well past the fold, which is how it came to read as a box that does not exist
-        // (2026-08-11). The box cannot move above the two fields it acts on, so the reference becomes a
-        // link instead.
+      ? // "the box below" was 2,596 characters below this banner — eight fields, and on a phone well past
+        // the fold, which is how it came to read as a box that does not exist (the owner, 2026-08-11). The
+        // box cannot move above the two fields it acts on, so the reference becomes a link instead.
         `<div class="flash warn">This interaction records a move to <b>${esc(stageLabel(i.stage_moved_to))}</b>, but ${esc(contact.full_name)} is currently in <b>${esc(stageLabel(contact.stage))}</b>. <a href="#applybox">Tick the box near the bottom of this form</a> to move the contact, or leave it to keep the history as a historical note only.</div>`
       : "";
 
   return c.html(
-    layout({
+    layout({ c,
       title: "Edit Interaction",
       body: `<main>
   <h1>Edit Interaction</h1>
@@ -1843,8 +1933,13 @@ app.get("/interactions/:id/edit", async (c) => {
       <div><label>Follow-Up This Set <span class="hint">shown on the history line</span></label><input type="date" name="next_follow_up_set" value="${esc(i.next_follow_up_set)}"></div>
       <div><label>Stage This Moved To</label>${select("stage_moved_to", STAGES, i.stage_moved_to, { blank: "—" })}</div>
     </div>
-    <label class="check" id="applybox"><input type="checkbox" name="apply_to_contact" value="1"> Also apply this stage and follow-up date to ${esc(contact.full_name)} now</label>
-    <p class="meta" style="margin-top:8px">Unticked, these two fields correct the history record only — the contact's current stage and follow-up date are unchanged. Ticked, the contact is updated to match and both changes are audited.</p>
+    <div class="row">
+      <div><label>Touch Every <span class="hint">days — blank means leave the cadence as it is. Used by Reach Out Later, Stay Connected and Pray</span></label>
+        <input type="number" name="touch_interval_days" min="1" max="${MAX_TOUCH_INTERVAL_DAYS}" list="intervals" value="${esc(contact.touch_interval_days)}" placeholder="e.g. 90">
+        <datalist id="intervals">${TOUCH_INTERVALS.map((d) => `<option value="${d}"></option>`).join("")}</datalist></div>
+    </div>
+    <label class="check" id="applybox"><input type="checkbox" name="apply_to_contact" value="1"> Also apply this stage, follow-up date, and cadence to ${esc(contact.full_name)} now</label>
+    <p class="meta" style="margin-top:8px">Unticked, these fields correct the history record only — the contact's current stage, follow-up date, and cadence are unchanged. Ticked, the contact is updated to match and every change is audited — same rule the main interaction form uses: a follow-up date typed above always wins, otherwise a cadence fills one in on Reach Out Later, Stay Connected or Pray, counted from this interaction's own date.</p>
     <div class="actions">
       <button type="submit">Save Changes</button>
       <a class="btn secondary" href="/contacts/${contact.id}">Cancel</a>
@@ -1865,6 +1960,18 @@ app.post("/interactions/:id/edit", async (c) => {
   const before = await c.env.DB.prepare("SELECT * FROM interaction WHERE id = ?").bind(iid).first<Interaction>();
   if (!before) return c.notFound();
   const f = await c.req.parseBody();
+
+  // Validated first, before anything is written — a bad cadence should mean nothing is saved, the same
+  // rule the main interaction form follows. Blank leaves the contact's stored cadence alone.
+  const submittedInterval = str(f.touch_interval_days);
+  let newInterval: number | null = null;
+  if (submittedInterval !== null) {
+    const n = Number(submittedInterval);
+    if (!Number.isInteger(n) || n < 1 || n > MAX_TOUCH_INTERVAL_DAYS)
+      return c.redirect(`/contacts/${before.contact_id}?flash=editbadcadence`);
+    newInterval = n;
+  }
+
   const after = {
     date: notFuture(str(f.date) ?? before.date),
     type: str(f.type) ?? before.type,
@@ -1912,12 +2019,12 @@ app.post("/interactions/:id/edit", async (c) => {
    *
    * WHY IT CHANGED. That last sentence was wrong, and production proved it. Moving an interaction's date
    * FORWARD puts history ahead of the ladder — the exact state the check calls drift — so the decision
-   * was manufacturing the condition its own guard reports as a problem. On 2026-08-26 an interaction's
-   * date was edited from 2026-08-11 to 2026-08-26; `last_attempt_at` stayed at 2026-08-11, and the chase
-   * list was ready to call that contact fifteen days silent on the morning they were emailed.
+   * was manufacturing the condition its own guard reports as a problem. On 2026-08-26 the owner edited
+   * interaction 159 from 2026-08-11 to 2026-08-26; `last_attempt_at` stayed at 2026-08-11, and the chase
+   * list was ready to call that contact fifteen days silent on the morning he was emailed.
    *
    * WHAT SURVIVES. The fear was real: a correction to old history must not reorder the worklist against
-   * the contact. Forward-only reconciliation answers it — the date can only move later and the rung can only
+   * him. Forward-only reconciliation answers it — the date can only move later and the rung can only
    * rise, so an edit can never make someone look MORE neglected than they are, and can never delete
    * evidence of outreach. Backdating an interaction still leaves the ladder untouched, which is the case
    * #57 actually cared about. See reconcileAttemptLadder for the full argument.
@@ -1994,20 +2101,35 @@ app.post("/interactions/:id/edit", async (c) => {
   }
 
   if (applyToContact) {
-    const contactBefore = await c.env.DB.prepare("SELECT stage, next_follow_up FROM contact WHERE id = ?")
+    const contactBefore = await c.env.DB.prepare("SELECT stage, next_follow_up, touch_interval_days FROM contact WHERE id = ?")
       .bind(before.contact_id)
-      .first<{ stage: string; next_follow_up: string | null }>();
+      .first<{ stage: string; next_follow_up: string | null; touch_interval_days: number | null }>();
+
+    /*
+     * Same follow-up-date precedence as the main "Record an Interaction" form (REL-027/REL-034), so the
+     * two forms produce the same result from the same inputs: a date typed here always wins; otherwise,
+     * on a non-terminal landing stage, an effective cadence (this form's value if changed, else the
+     * contact's stored one) computes one, counted from the interaction's own date rather than today.
+     * Terminal stages get nothing either way.
+     */
+    const landingStage = after.stage_moved_to ?? contactBefore?.stage ?? "";
+    const landingTerminal = (TERMINAL_STAGES as readonly string[]).includes(landingStage);
+    const effectiveInterval = newInterval ?? contactBefore?.touch_interval_days ?? null;
+    const nextFollowUpToApply =
+      after.next_follow_up_set ?? (!landingTerminal && effectiveInterval ? plusDays(effectiveInterval, after.date) : null);
+
     await c.env.DB.prepare(
       `UPDATE contact SET stage = COALESCE(?, stage), next_follow_up = COALESCE(?, next_follow_up),
-        updated_at = datetime('now') WHERE id = ?`
+        touch_interval_days = COALESCE(?, touch_interval_days), updated_at = datetime('now') WHERE id = ?`
     )
-      .bind(after.stage_moved_to, after.next_follow_up_set, before.contact_id)
+      .bind(after.stage_moved_to, nextFollowUpToApply, newInterval, before.contact_id)
       .run();
     const contactDiff = fieldDiff(
-      { stage: contactBefore?.stage, next_follow_up: contactBefore?.next_follow_up },
+      { stage: contactBefore?.stage, next_follow_up: contactBefore?.next_follow_up, touch_interval_days: contactBefore?.touch_interval_days },
       {
         stage: after.stage_moved_to ?? contactBefore?.stage,
-        next_follow_up: after.next_follow_up_set ?? contactBefore?.next_follow_up,
+        next_follow_up: nextFollowUpToApply ?? contactBefore?.next_follow_up,
+        touch_interval_days: newInterval ?? contactBefore?.touch_interval_days,
       }
     );
     if (contactDiff)

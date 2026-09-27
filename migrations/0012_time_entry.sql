@@ -1,7 +1,7 @@
 -- 0012 — time entries (TIME-001, issue #90).
 --
--- "I would still like to know each week the hours I've worked on specific activities" — raised above
--- the user-accounts work in the same conversation, 2026-08-11.
+-- "I would still like to know each week the hours I've worked on specific activities" — the owner,
+-- 2026-08-11, raised above the user-accounts work in the same conversation.
 --
 -- Why this exists before the calendar import
 -- -----------------------------------------

@@ -1,5 +1,5 @@
 /*
- * PURS-001 — the pipeline, the people on it, and what the wins and losses add up to.
+ * PURS-001 — the pipeline, the people on it, and what the wins and losses add up to (the owner 2026-09-02).
  *
  * WHAT THIS IS NOT. There is no `pursuit` table. A pursuit and an engagement are the same row at
  * different ages — migration 0022's header carries the full argument, and the short version is that
@@ -30,9 +30,10 @@ import {
   type Engagement,
   type PursuitContact,
 } from "./types";
+import { actor } from "./auth";
+import { currentZone } from "./weeks";
 
 const app = new Hono<{ Bindings: Bindings }>();
-const ACTOR = "operator";
 
 const str = (v: unknown): string | null => {
   if (typeof v !== "string") return null;
@@ -46,11 +47,11 @@ export function money(v: number | null | undefined): string {
   return `$${Math.round(v).toLocaleString("en-US")}`;
 }
 
-/** Today in the practice's configured time zone. Same reasoning, and the same bug avoided, as digest.ts localToday(). */
+/** Today in the owner's zone. Same reasoning, and the same bug avoided, as digest.ts localToday(). */
 export function localToday(now: Date = new Date()): string {
   try {
     return new Intl.DateTimeFormat("en-CA", {
-      timeZone: "America/Chicago",
+      timeZone: currentZone(),
       year: "numeric",
       month: "2-digit",
       day: "2-digit",
@@ -229,7 +230,7 @@ app.post("/engagements/:id/people", async (c) => {
     "INSERT INTO audit_event (actor, entity, entity_id, action, before_summary, after_summary, source, correlation_id) VALUES (?,'engagement',?,?,?,?,'app',?)"
   )
     .bind(
-      ACTOR,
+      actor(),
       String(id),
       "person-added",
       null,
@@ -258,7 +259,7 @@ app.post("/engagements/:id/people/remove", async (c) => {
     "INSERT INTO audit_event (actor, entity, entity_id, action, before_summary, after_summary, source, correlation_id) VALUES (?,'engagement',?,?,?,?,'app',?)"
   )
     .bind(
-      ACTOR,
+      actor(),
       String(id),
       "person-removed",
       `${who?.full_name ?? contactId} as ${labelFor(PURSUIT_ROLES, role)}`,
@@ -323,10 +324,9 @@ export async function pursuitsNeedingAttention(
 /**
  * Demand, counted honestly.
  *
- * THE LOSSES ARE THE POINT. The point of tracking demand is to see what work is actually wanted, and won
- * work only says what was SOLD. A handful of pursuits in one service line lost on budget timing beside a
- * couple of pursuits won in another can read as "the winning line is in demand" if you count only the
- * wins — survivorship bias with a chart on top. So
+ * THE LOSSES ARE THE POINT. The owner asked to "track what work is in most demand", and won work only says
+ * what was SOLD. Three org-design pursuits lost on budget timing beside two change projects won reads as
+ * "change management is in demand" if you count only the wins — survivorship bias with a chart on top. So
  * every row here shows open, won and lost side by side, and a win rate computed only over DECIDED
  * pursuits, because counting open ones as losses would flatter nothing and understate everything.
  */
@@ -451,9 +451,17 @@ app.get("/pursuits", async (c) => {
     </section>`;
   };
 
+  // Every heading in the two demand tables and the "why pursuits ended" table below links to the
+  // matching filtered engagement list (2026-09-16, the owner) rather than making the underlying pursuits
+  // something you have to go find by eye. `d.key === null` ("not recorded") links with an empty value,
+  // which engagementList()'s filter reads as "column IS NULL" — see its own comment for why.
+  const demandLink = (filterColumn: "service_type" | "origin", key: string | null) =>
+    `/engagements?${filterColumn}=${key ? encodeURIComponent(key) : ""}`;
+
   const demandTable = (
     title: string,
     column: string,
+    filterColumn: "service_type" | "origin",
     lead: string,
     data: Awaited<ReturnType<typeof demandBy>>,
     vocab: readonly (readonly [string, string])[] | null
@@ -466,7 +474,7 @@ app.get("/pursuits", async (c) => {
             .map((d) => {
               const decided = d.won_n + d.lost_n;
               return `<tr>
-        <td><b>${esc(d.key ? (vocab ? labelFor(vocab, d.key) : d.key) : "not recorded")}</b></td>
+        <td><a href="${demandLink(filterColumn, d.key)}"><b>${esc(d.key ? (vocab ? labelFor(vocab, d.key) : d.key) : "not recorded")}</b></a></td>
         <td style="text-align:right" data-label="Open">${d.open_n || "—"}${
                 d.open_value ? `<div class="meta">${esc(money(d.open_value))}</div>` : ""
               }</td>
@@ -492,13 +500,15 @@ app.get("/pursuits", async (c) => {
   </div>`;
 
   return c.html(
-    layout({
+    layout({ c,
       title: "Pursuits",
       body: `<main>
   <h1>Pursuits</h1>
-  <p class="sub">${rows.length} open pursuit${rows.length === 1 ? "" : "s"} · ${esc(
-    money(total)
-  )} · <a href="/engagements">all engagements</a> · <a href="/">dashboard</a></p>
+  <p class="meta" style="margin:0 0 4px">${rows.length} open pursuit${rows.length === 1 ? "" : "s"} · ${esc(money(total))}</p>
+  <div class="linkbar">
+    <a class="linkchip" href="/engagements">All Engagements</a>
+    <a class="linkchip" href="/">Dashboard</a>
+  </div>
   <div class="actions" style="margin:0 0 14px"><a class="btn" href="/engagements/new">New Pursuit</a></div>
   ${
     rows.length && (unpriced || undated || nostep)
@@ -515,6 +525,7 @@ app.get("/pursuits", async (c) => {
   ${demandTable(
     "Demand by service type",
     "Service type",
+    "service_type",
     "Open, won and lost together. <b>Counting only the wins would tell you what you sold, not what is in demand</b> — the losses are half the answer, and the win rate is computed over decided pursuits only, so open ones are not silently treated as failures.",
     byService,
     SERVICE_TYPES
@@ -522,6 +533,7 @@ app.get("/pursuits", async (c) => {
   ${demandTable(
     "Demand by where it came from",
     "Source",
+    "origin",
     "Which channel produces <b>paid work</b>, as opposed to conversations. These are not the same list, and this is the table that says so.",
     byOrigin,
     PURSUIT_ORIGINS
@@ -534,7 +546,7 @@ app.get("/pursuits", async (c) => {
     <table><thead><tr><th>Reason</th><th style="text-align:right">Count</th></tr></thead><tbody>${losses
       .map(
         (l) =>
-          `<tr><td>${esc(l.reason ? labelFor(OUTCOME_REASONS, l.reason) : "not recorded")}</td><td style="text-align:right"><b>${l.n}</b></td></tr>`
+          `<tr><td><a href="/engagements?outcome_reason=${l.reason ? encodeURIComponent(l.reason) : ""}">${esc(l.reason ? labelFor(OUTCOME_REASONS, l.reason) : "not recorded")}</a></td><td style="text-align:right"><b>${l.n}</b></td></tr>`
       )
       .join("")}</tbody></table>
   </section>`

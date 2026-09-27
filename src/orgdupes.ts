@@ -1,27 +1,27 @@
 /*
- * ORG-002 — the possible-duplicate organizations queue.
+ * ORG-002 — the possible-duplicate organizations queue (the owner 2026-09-02).
  *
  * ============================================================================================
  * THE CONSTRAINT THAT SHAPED THIS
  * ============================================================================================
- * Some companies have sub-businesses that are legitimately separate — a professional-services firm can
- * have several real, distinct practices that look like near-duplicates by name alone.
+ * The owner: "I would need to be able to validate duplicate entries because some companies (like Alvarez &
+ * Marsal) have sub-businesses that are legitimate. I would prefer to have a list of potential duplicates
+ * that I can go through, update (consolidate if necessary or mark as not a duplicate)."
  *
  * So: NOTHING IS EVER MERGED AUTOMATICALLY. Every rule below is a suggestion with a stated reason, and the
  * three answers are merge, not-a-duplicate, or leave it for later. A rule that collapsed similar names
- * would eventually merge two genuinely separate entities and there would be nothing on any screen to say
- * so.
+ * would eventually merge two real A&M practices and there would be nothing on any screen to say so.
  *
  * "Not a duplicate" is STORED (migration 0023), which is the difference between a queue you work through
- * and a queue you abandon. Without it, pairs already judged would reappear on every visit and again every
- * time an import touches either side.
+ * and a queue you abandon. Without it, the pairs he has already judged reappear on every visit and again
+ * every time an import touches either side.
  *
  * ============================================================================================
  * WHY THIS IS NOT A BRUTE-FORCE COMPARISON
  * ============================================================================================
- * A few thousand organizations already produce millions of unordered pairs. Comparing them all in a
- * Worker request is the same cost model that has caused large imports to time out elsewhere in this app,
- * and the lesson there was to stop iterating over the cross product.
+ * 2,120 organizations is 2,246,140 unordered pairs. Comparing them all in a Worker request is the same
+ * cost model that killed the 4,583-row import on 2026-08-20 (see definitions.md §7), and the lesson there
+ * was to stop iterating over the cross product.
  *
  * So candidates are BLOCKED first — standard record-linkage practice. A pair is only ever compared if it
  * shares a blocking key:
@@ -30,17 +30,17 @@
  *   2. an email domain, taken from the contacts at each company
  *   3. a distinctive word — a token appearing in a FEW companies, never a common one
  *
- * Rule 3 is what catches near-miss spellings of the same firm — two names that normalise to different
- * strings and share no first word, but share a distinctive token that appears in almost nothing else. A
- * token appearing in more than TOKEN_MAX_ORGS companies is discarded as a blocking key, because
- * `consulting` or `group` would otherwise generate thousands of pairs and nothing useful. That cap is the
- * whole reason this is tractable.
+ * Rule 3 is what catches a misspelling. "Harbor & Wexley" and "Harber and Wexley" normalise to `harbor
+ * wexley` and `harber wexley`, which are not equal and share no first word — but they share the token
+ * `wexley`, which appears in almost nothing else. A token appearing in more than TOKEN_MAX_ORGS companies
+ * is discarded as a blocking key, because `consulting` or `group` would otherwise generate thousands of
+ * pairs and nothing useful. That cap is the whole reason this is tractable.
  *
  * ============================================================================================
  * WHY THE REASON IS SHOWN ON EVERY ROW
  * ============================================================================================
  * A shared email domain and a shared distinctive word are very different levels of evidence, and the
- * person judging needs to know which they are looking at. Showing "same email domain: example.com" lets a
+ * person judging needs to know which they are looking at. Showing "same email domain: datum.com" lets a
  * pair be decided in a second; showing a bare "possible duplicate" makes every pair equally expensive to
  * think about, which is how a 40-pair queue becomes a 40-pair backlog.
  */
@@ -48,17 +48,17 @@
 import { Hono } from "hono";
 import { esc, layout } from "./views";
 import { ORG_RELATIONSHIP, labelFor, type Bindings, type D1Db } from "./types";
+import { actor } from "./auth";
 
 const app = new Hono<{ Bindings: Bindings }>();
-const ACTOR = "operator";
 
 /**
  * A word shared by more than this many companies is not distinctive, so it is not a blocking key.
  *
- * Six is judgement, not arithmetic. It has to be above 2 — a genuine multi-entity firm can legitimately
- * have three or four rows, and they all need to be offered against each other — and low enough that
- * industry words are excluded. In practice the tokens this admits are surnames and coined names; the ones
- * it rejects are `consulting`, `group`, `health`, `partners`, `services`.
+ * Six is judgement, not arithmetic. It has to be above 2 — a genuine multi-entity firm like Alvarez &
+ * Marsal can legitimately have three or four rows, and they all need to be offered against each other —
+ * and low enough that industry words are excluded. On the owner's data the tokens this admits are surnames
+ * and coined names; the ones it rejects are `consulting`, `group`, `health`, `partners`, `services`.
  */
 const TOKEN_MAX_ORGS = 6;
 
@@ -73,8 +73,8 @@ const SUFFIXES = new Set([
 
 /**
  * Words too common to distinguish one company from another. Stripped from the token index only — they
- * are still part of the normalised name, because "Example Group" and "Example Health" must not normalise
- * to the same string just because `group` and `health` are unhelpful as search keys.
+ * are still part of the normalised name, because "Acme Group" and "Acme Health" must not normalise to
+ * the same string just because `group` and `health` are unhelpful as search keys.
  */
 const STOPWORDS = new Set([
   "the", "of", "and", "for", "group", "holdings", "partners", "associates", "consulting", "consultants",
@@ -158,10 +158,13 @@ export interface Candidate {
    * THE PEOPLE WHO ACTUALLY CAUSED A DOMAIN MATCH, one list per side. Empty for the name-based rules,
    * where the whole company matched and no individual is to blame.
    *
-   * This mattered in practice: an earlier version of this rule collapsed matches down to a set of company
-   * ids and then offered a link to every contact at that company, throwing away the one fact that makes a
-   * pair decidable — which individuals actually share the domain — and asking the reviewer to re-derive by
-   * hand, one company at a time, what the query had already computed.
+   * Added 2026-09-03 on the owner's report, and it was a real failure of the first version: "it then lists
+   * ALL people in Contoso vs. just the ones that are causing the conflict… For Harbor & Wexley and Fabrikam
+   * Group, I have to go through 63 people to find the one that is causing the conflict."
+   *
+   * The rule KNEW. `byDomain` was built from a per-contact query and then collapsed to a set of company
+   * ids, throwing away the one fact that makes the pair decidable. The screen then offered a link to all
+   * 63 people at the company — asking him to re-derive by hand what the query had already computed.
    */
   aPeople: Culprit[];
   bPeople: Culprit[];
@@ -177,15 +180,14 @@ const key = (x: number, y: number) => (x < y ? `${x}:${y}` : `${y}:${x}`);
  *   1. SHARED EMAIL DOMAIN — the strongest signal available and it needs no name similarity at all.
  *      People at the same company have the same email domain; that is what a company domain IS. Free
  *      providers are excluded, or every contact with a gmail address would match every other.
- *   2. IDENTICAL NORMALISED NAME — "Example Engineers, Inc." and "Example Engineers LLC". Only punctuation
+ *   2. IDENTICAL NORMALISED NAME — "Acme Engineers, Inc." and "Acme Engineers LLC". Only punctuation
  *      and legal form separate them, and a legal-form difference is occasionally real, which is why this
  *      is a suggestion rather than an automatic merge.
- *   3. ONE NAME CONTAINS THE OTHER — "Example" inside "Example Engineers". Common in a list built by
- *      typing company names on the fly, such as during calendar-category matching.
- *   4. A DISTINCTIVE SHARED WORD, plus a small edit distance or a strong word overlap — catches near-miss
- *      spellings of the same firm. Weakest of the four and deliberately last, because it is the one that
- *      will offer pairs that are not duplicates. That is acceptable when the answer is one click and
- *      remembered forever.
+ *   3. ONE NAME CONTAINS THE OTHER — "Acme" inside "Acme Engineers". The owner's own example from the
+ *      calendar import work, and common in a list built by typing company names on the fly.
+ *   4. A DISTINCTIVE SHARED WORD, plus a small edit distance or a strong word overlap — the misspelling case.
+ *      Weakest of the four and deliberately last, because it is the one that will offer pairs that are
+ *      not duplicates. That is acceptable when the answer is one click and remembered forever.
  */
 export async function candidates(db: D1Db, limit = PAGE): Promise<{ rows: Candidate[]; total: number }> {
   const { results: orgs } = await db
@@ -294,7 +296,7 @@ export async function candidates(db: D1Db, limit = PAGE): Promise<{ rows: Candid
   for (const r of domainRows) addDomain(r.dom, r.org, { id: r.id, name: r.name, email: r.email });
   /*
    * The company's OWN `domain` field counts too, with no person attached — nobody is at fault when the
-   * match comes from a field typed directly on the company record itself.
+   * match comes from a field the owner typed on the company record itself.
    */
   for (const o of byId.values()) addDomain(o.domain, o.id, null);
 
@@ -343,7 +345,7 @@ export async function candidates(db: D1Db, limit = PAGE): Promise<{ rows: Candid
         const b = byId.get(ids[j])!;
         const [shorter, longer] = a.norm.length <= b.norm.length ? [a.norm, b.norm] : [b.norm, a.norm];
 
-        // rule 3 — containment, on whole words so "acme" does not match "acmex"
+        // rule 3 — containment, on whole words so "datum" does not match "datumex"
         if (longer === shorter || longer.startsWith(`${shorter} `) || longer.endsWith(` ${shorter}`) || longer.includes(` ${shorter} `)) {
           offer(a.id, b.id, 3, `one name contains the other — “${shorter}” inside “${longer}”`);
           continue;
@@ -380,7 +382,7 @@ const STRENGTH_PILL = ["", "green", "green", "", "amber"];
 /**
  * The name as it appears ON A BUTTON, which is not the same job as the name in the list above it.
  *
- * `Keep "Example Industries Tax Advisory, LLC"` renders a 340px button, and two of those side by side wrap
+ * `Keep "Harbor & Wexley Tax Advisory, LLC"` renders a 340px button, and two of those side by side wrap
  * onto separate lines on a phone and read like two unrelated actions. The full name is directly above in
  * the pair itself and repeated in the button's title, so truncating here loses nothing — measured at
  * 390px, where the untruncated version was the widest element on the page.
@@ -398,9 +400,9 @@ app.get("/organizations/duplicates", async (c) => {
   /*
    * THE PEOPLE WHO CAUSED IT, not the people who work there.
    *
-   * Listing every contact at both companies is unhelpful when only one or two people actually caused the
-   * domain match — at a company with dozens of contacts, asking the reviewer to scan the whole list to
-   * find the one causing the conflict defeats the purpose of a review queue.
+   * The owner, 2026-09-03: "it then lists ALL people in Contoso vs. just the ones that are causing the
+   * conflict… For Harbor & Wexley and Fabrikam Group, I have to go through 63 people to find the one that
+   * is causing the conflict."
    *
    * So a domain match names the individuals whose own address produced it, with the address, each linking
    * to their record. `see the people` survives only as a secondary link and only when there is nobody
@@ -412,9 +414,10 @@ app.get("/organizations/duplicates", async (c) => {
    * Is this domain NORMAL at this company, or is it the exception?
    *
    * THIS IS THE WHOLE POINT OF THE SECOND PASS. Naming the matching people was necessary but not
-   * sufficient: a domain can be the clear majority pattern at one company — simply its own email domain —
-   * while only a small minority of contacts at the other company happen to share it. Listing every name on
-   * the majority side alongside the few on the minority side buries the actual finding in the evidence.
+   * sufficient: on the Harbor & Wexley / Fabrikam Group pair, 39 of H&W's 39 emailed contacts use
+   * `harborwexley.com` — which is not an anomaly, it is simply H&W's email domain — while 2 of
+   * Fabrikam's 26 do. Listing all 39 H&W names alongside the 2 Fabrikam names buries the finding in the
+   * evidence and hands back the problem the owner reported.
    *
    * So the majority side is summarised in a sentence and the minority side is named person by person.
    * Half is the threshold, and the denominator is contacts WITH a work email — a company where most
@@ -486,9 +489,9 @@ app.get("/organizations/duplicates", async (c) => {
    * The odd side of a domain match: one company where the domain is normal, one where it is not.
    *
    * When that shape holds, the honest reading is usually NOT that two companies are one — it is that a
-   * handful of contacts are filed under the wrong employer, carrying an email address that belongs to a
-   * different company than the one recorded on their contact record. Merging the two companies over that
-   * would be a large, wrong, silent change, so the screen says so before it offers either merge button.
+   * handful of contacts are filed under the wrong employer. The owner's own case: "one contact had
+   * Contoso as his company but a .tailspin.com email address." Merging Contoso into Tailspin over that would have
+   * been a large, wrong, silent change, so the screen says so before it offers either merge button.
    */
   const misfiled = (p: Candidate) => {
     if (p.strength !== 1) return null;
@@ -578,7 +581,7 @@ app.get("/organizations/duplicates", async (c) => {
     </div>`;
 
   return c.html(
-    layout({
+    layout({ c,
       title: "Possible Duplicates",
       body: `<main>
   ${
@@ -596,7 +599,7 @@ app.get("/organizations/duplicates", async (c) => {
 
   <div class="card">
     <p style="margin:0 0 6px"><b>Nothing here merges on its own.</b> Every pair below is a suggestion with the reason it was suggested, and there are three answers: keep one and merge, mark them as different companies, or leave it and come back.</p>
-    <p class="meta" style="margin:0">Marking a pair <b>not a duplicate</b> is permanent — it will not be offered again, including after an import adds contacts to either side. That is what makes this list something you can finish. Firms with legitimately separate entities (a multi-brand holding company, say) get marked once and stay marked.</p>
+    <p class="meta" style="margin:0">Marking a pair <b>not a duplicate</b> is permanent — it will not be offered again, including after an import adds contacts to either side. That is what makes this list something you can finish. Firms with legitimately separate entities (an Alvarez &amp; Marsal practice, say) get marked once and stay marked.</p>
   </div>
 
   ${pairs}
@@ -633,7 +636,7 @@ app.post("/organizations/not-duplicate", async (c) => {
     "INSERT INTO audit_event (actor, entity, entity_id, action, before_summary, after_summary, source, correlation_id) VALUES (?,'organization',?,?,?,?,'app',?)"
   )
     .bind(
-      ACTOR,
+      actor(),
       String(lo),
       "not-duplicate",
       null,
@@ -680,9 +683,9 @@ app.post("/organizations/merge", async (c) => {
     .first<{ contacts: number; engagements: number }>();
 
   /*
-   * FILL BLANKS ONLY — never overwrite. The surviving row is the one the user chose to keep, so its own
+   * FILL BLANKS ONLY — never overwrite. The surviving row is the one the owner chose to keep, so its own
    * values are the deliberate ones; the other row's are worth having only where the survivor has nothing.
-   * A merge that silently replaced a value someone had typed with one from a row being discarded would be
+   * A merge that silently replaced an address he had typed with one from a row he was discarding would be
    * the sort of quiet data change this codebase keeps trying to avoid.
    */
   const FILLABLE = ["domain", "industry", "address", "relationship_status", "calendar_tag"] as const;
@@ -731,7 +734,7 @@ app.post("/organizations/merge", async (c) => {
     c.env.DB.prepare("DELETE FROM organization WHERE id = ?").bind(drop),
     c.env.DB.prepare(
       "INSERT INTO audit_event (actor, entity, entity_id, action, before_summary, after_summary, source, correlation_id) VALUES (?,'organization',?,?,?,?,'app',?)"
-    ).bind(ACTOR, String(keep), "merge", String(doomed.name), summary, `organization-merge-${drop}`),
+    ).bind(actor(), String(keep), "merge", String(doomed.name), summary, `organization-merge-${drop}`),
   ];
 
   await c.env.DB.batch(statements);

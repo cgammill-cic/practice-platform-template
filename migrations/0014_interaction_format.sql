@@ -1,7 +1,7 @@
 -- 0014 — what a meeting actually was (REL-026, issue #92).
 --
--- "I want to know if (and be able to report on) a meeting was: meal, coffee, Teams,
--- phone call, or other. I'm not sure how to proceed." (2026-08-11)
+-- The owner, 2026-08-11: "I want to know if (and be able to report on) a meeting was: meal, coffee, Teams,
+-- phone call, or other. I'm not sure how to proceed."
 --
 -- A SEPARATE AXIS FROM `type`, not a new type
 -- ------------------------------------------
@@ -23,7 +23,7 @@
 -- 0013 this needs no table rebuild and cannot disturb the 72+ interaction rows or their ids.
 --
 -- THE LIST IS WORTH SETTLING NOW, because changing it later DOES mean a rebuild. Seven values, covering
--- what was named above plus the distinction that turned out to matter in a real calendar — an in-person
+-- what the owner named plus the distinction that turned out to matter in his real calendar — an in-person
 -- meeting that is neither a meal nor a coffee is common enough to deserve its own value rather than
 -- landing in `other` beside a phone call.
 --

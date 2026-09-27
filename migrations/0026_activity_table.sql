@@ -1,6 +1,6 @@
--- 0026 — the activity vocabulary moves off a CHECK constraint and into a real table (2026-09-09).
+-- 0026 — the activity vocabulary moves off a CHECK constraint and into a real table (the owner, 2026-09-09).
 --
--- THE REQUEST: "Can I have the application create a new category when I've added it to Outlook, but ask me
+-- HIS WORDS: "Can I have the application create a new category when I've added it to Outlook, but ask me
 -- how to apply it in the app?" The immediate need was one category, Vacation/Holiday — but the honest
 -- answer to "can the app create one itself" was no, and this migration is what makes it yes.
 --
@@ -30,7 +30,7 @@
 -- non-work activity before, and after this migration Vacation/Holiday is a second one, which is exactly why
 -- NON_WORK_ACTIVITY (a single name) had to become a per-row flag rather than staying a constant.
 --
--- SEEDED WITH THE ORIGINAL TEN, PLUS Vacation/Holiday AS AN ELEVENTH — the original request, and the first
+-- SEEDED WITH THE ORIGINAL TEN, PLUS Vacation/Holiday AS AN ELEVENTH — the owner's own request, and the first
 -- real use of the new mechanism rather than something only provable in the abstract. is_work = 0, the same
 -- shape as Personal: real time, not worked time.
 --

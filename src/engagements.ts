@@ -8,8 +8,8 @@
  * 2026-08-11: the table was empty. So this is a screen, not a redesign, and the same shape of gap as
  * REL-005, where `referral_source_contact_id` was maintained by the delete path but no form could set it.
  *
- * WHY THERE IS NO SEPARATE "CUSTOMER" RECORD. The request was for a way to create customers in the tool
- * that link back to QuickBooks. A customer here is an ORGANIZATION you have an engagement with —
+ * WHY THERE IS NO SEPARATE "CUSTOMER" RECORD. The owner asked for "a way to create customers in the tool
+ * that I can link back to QuickBooks". A customer here is an ORGANIZATION you have an engagement with —
  * `organization` already exists, is already created automatically when you type a new one on a contact
  * form, and already holds the contacts. Adding a fourth kind of record for the same real-world company
  * would mean two names to keep in step and a reconciliation nobody asked for. The QuickBooks id hangs off
@@ -34,22 +34,27 @@ import {
   resolveContactByName,
 } from "./pursuits";
 import {
+  BILLABLE_ACTIVITY,
   BILLING_METHODS,
   CLOSED_STAGES,
+  DEAD_STAGES,
   ENGAGEMENT_STATUSES,
   NOT_TO_EXCEED,
   OUTCOME_REASONS,
   PURSUIT_ORIGINS,
   SERVICE_TYPES,
   isDead,
+  isLive,
+  isPursuit,
   labelFor,
   type Bindings,
   type D1Db,
   type Engagement,
 } from "./types";
+import { actor, isAdmin } from "./auth";
+import { commitmentBlock, listCommitments } from "./commitments";
 
 const app = new Hono<{ Bindings: Bindings }>();
-const ACTOR = "operator";
 
 const str = (v: unknown): string | null => {
   if (typeof v !== "string") return null;
@@ -73,24 +78,81 @@ async function audit(db: D1Db, id: number, action: string, after: string, before
     .prepare(
       "INSERT INTO audit_event (actor, entity, entity_id, action, before_summary, after_summary, source, correlation_id) VALUES (?,'engagement',?,?,?,?,'app',?)"
     )
-    .bind(ACTOR, String(id), action, before ?? null, after, `engagement-${id}`)
+    .bind(actor(), String(id), action, before ?? null, after, `engagement-${id}`)
     .run();
 }
 
 /**
- * Engagements with their organization, and the hours logged against each.
+ * Engagements with their organization, and the hours logged against each — both the total, and the
+ * BILLABLE_ACTIVITY ("Client Delivery") slice of it.
  *
- * The hours subquery is why this list is worth looking at rather than being a lookup table: an engagement
- * with a QuickBooks id and no hours is either not started or not being tracked, and both are worth seeing.
+ * TWO HOURS FIGURES, KEPT INDEPENDENT (the owner, 2026-09-22: "Pursuits should track hours for billing but
+ * I like capturing the time spent on each pursuit as well, they should just be show independently.")
+ * `logged_hours` is everything logged against the row, any activity — the number a pursuit's own effort
+ * is measured by, win or lose. `billable_hours` is the slice that actually feeds an invoice. They are
+ * never combined into one column: an engagement can carry plenty of non-billable hours (admin, travel)
+ * that would overstate what it bills, and a pursuit's hours are not billable at all by definition (see
+ * pickableEngagements() below on why a lost pursuit must never accrue Client Delivery time). The
+ * customer-grouped view shows `billable_hours` under Engagements and `logged_hours` under Pursuits —
+ * this query just always computes both, so either page can pick the one it means.
+ *
+ * `filter` is the click-through from the Pursuits demand tables (2026-09-16): each heading there — a
+ * service type, a source, a reason a pursuit ended — links here rather than making someone go find the
+ * matching rows by eye. `value: null` means "match rows where the column is unset" (the demand tables'
+ * own "not recorded" row), not "no filter" — that case is `filter` itself being undefined. Deliberately
+ * no WHERE clause on status for service_type/origin, matching demandBy()'s own scope in pursuits.ts:
+ * those tables count open, won and lost together on purpose. outcome_reason is the one exception — it
+ * only ever means something on a pursuit that ended without becoming work, so its filter also matches
+ * lossReasons()'s own scope (DEAD_STAGES only), so the rows shown here are exactly the ones that reason's
+ * count in the table was counting.
  */
-export async function engagementList(db: D1Db): Promise<(Engagement & { logged_hours: number | null })[]> {
+export async function engagementList(
+  db: D1Db,
+  filter?: { column: "service_type" | "origin" | "outcome_reason"; value: string | null }
+): Promise<(Engagement & { logged_hours: number | null; billable_hours: number | null })[]> {
+  let where = "";
+  const params: unknown[] = [];
+  if (filter) {
+    const valueClause = filter.value === null ? `e.${filter.column} IS NULL` : `e.${filter.column} = ?`;
+    if (filter.value !== null) params.push(filter.value);
+    if (filter.column === "outcome_reason") {
+      where = `WHERE ${valueClause} AND e.status IN (${DEAD_STAGES.map(() => "?").join(",")})`;
+      params.push(...DEAD_STAGES);
+    } else {
+      where = `WHERE ${valueClause}`;
+    }
+  }
+  const { results } = await db
+    .prepare(
+      `SELECT e.*, o.name AS organization_name,
+          (SELECT ROUND(SUM(t.hours), 2) FROM time_entry t WHERE t.engagement_id = e.id) AS logged_hours,
+          (SELECT ROUND(SUM(t.hours), 2) FROM time_entry t WHERE t.engagement_id = e.id AND t.activity = ?) AS billable_hours
+         FROM engagement e LEFT JOIN organization o ON o.id = e.organization_id
+         ${where}
+        ORDER BY (e.status <> 'active'), o.name, e.name`
+    )
+    .bind(BILLABLE_ACTIVITY, ...params)
+    .all<Engagement & { logged_hours: number | null; billable_hours: number | null }>();
+  return results;
+}
+
+/**
+ * Lost pursuits for one customer — the drill-in behind the "N lost pursuits" link on the customer-grouped
+ * view (the owner, 2026-09-22: "a link for lost pursuits under companies with lost accounts, then you can
+ * drill into the pursuits to get more information"). Kept off the main grouped page so a customer's
+ * current picture — what is being chased, what is live — is not buried under everything that never
+ * went anywhere; the history is one click away rather than deleted.
+ */
+async function deadPursuitsForOrg(db: D1Db, organizationId: number): Promise<EngagementRow[]> {
   const { results } = await db
     .prepare(
       `SELECT e.*, o.name AS organization_name,
           (SELECT ROUND(SUM(t.hours), 2) FROM time_entry t WHERE t.engagement_id = e.id) AS logged_hours
          FROM engagement e LEFT JOIN organization o ON o.id = e.organization_id
-        ORDER BY (e.status <> 'active'), o.name, e.name`
+        WHERE e.organization_id = ? AND e.status IN (${DEAD_STAGES.map(() => "?").join(",")})
+        ORDER BY e.decided_at DESC, e.name`
     )
+    .bind(organizationId, ...DEAD_STAGES)
     .all<Engagement & { logged_hours: number | null }>();
   return results;
 }
@@ -98,10 +160,10 @@ export async function engagementList(db: D1Db): Promise<(Engagement & { logged_h
 /*
  * Engagements you can pick when logging time — which is NOT the same as engagements that are active.
  *
- * THIS USED TO FILTER `status = 'active'` AND THAT WAS THE BUG. A newly added client was not pulling
- * through to the customer dropdown on the Outlook import at all. That engagement was saved as
- * **prospective**, which is accurate — it is a retainer being pursued, not yet signed — and the picker
- * then refused to offer it at all.
+ * THIS USED TO FILTER `status = 'active'` AND THAT WAS THE BUG. The owner, 2026-08-13: "I updated the Client
+ * tab to include Datum, but it is not pulling through to the customer dropdown on the import from Outlook
+ * file." The Datum engagement was saved as **prospective**, which is accurate — it is a retainer being
+ * pursued, not yet signed — and the picker then refused to offer it at all.
  *
  * That is backwards. Business Development hours are, by definition, spent on work that is not yet active;
  * an engagement being prospective is the reason the time exists, not a reason to be unable to record it.
@@ -116,8 +178,8 @@ export async function engagementList(db: D1Db): Promise<(Engagement & { logged_h
  * pursuits, so it holds rows that were LOST — and offering a lost pursuit here would invite hours onto
  * work that never existed, which is worse than the back-dating case because there is no invoice to
  * contradict it. Everything in DEAD_STAGES is excluded alongside `complete`. Open pursuits are offered,
- * for exactly the reason the bug above proves: Pursuit/Proposal hours are the cost of chasing work that
- * is not yet won, and refusing to log them loses the number that makes win rate meaningful.
+ * for exactly the reason the Datum bug above proves: Pursuit/Proposal hours are the cost of chasing work
+ * that is not yet won, and refusing to log them loses the number that makes win rate meaningful.
  *
  * Non-active engagements carry their status in the label, so choosing one is a visible decision rather
  * than an indistinguishable row in a dropdown. Active ones sort first.
@@ -199,6 +261,8 @@ function engagementForm(opts: {
   originContactName?: string | null;
   /** Rendered only when editing — a new pursuit has no id to hang a role on yet. */
   peopleSection?: string;
+  /** Sales commitments tied to this pursuit (0035); admin-only, so absent for members. */
+  commitmentsSection?: string;
   error?: string;
 }): string {
   const e = opts.engagement ?? {};
@@ -230,14 +294,14 @@ function engagementForm(opts: {
     <div class="row">
       <div><label>Outlook Category <span class="hint">optional — what you type on calendar events for this client</span></label>
         <input type="text" name="calendar_tag" value="${esc(e.calendar_tag)}" placeholder="e.g. Acme">
-        <p class="meta" style="margin-top:4px">Leave blank when the category is just the customer name — the import matches on the name by default. Fill it in when they differ: the category <code>Acme</code> against a customer recorded as <code>Acme Engineers, Inc.</code> Saved on the <b>organization</b>, so every engagement for this client uses it${
+        <p class="meta" style="margin-top:4px">Leave blank when the category is just the customer name — the import matches on the name by default. Fill it in when they differ: the category <code>Datum</code> against a customer recorded as <code>Datum Engineers, Inc.</code> Saved on the <b>organization</b>, so every engagement for this client uses it${
           e.organization_id ? ` — or edit it, with the address and everything else, on <a href="/organizations/${e.organization_id}/edit">the company record</a>` : ""
         }.</p></div>
     </div>
     ${/*
-      SERVICE TYPE IS NOW A CONTROLLED LIST: free-text service types meant an Organizational Design
-      engagement could get filed as `Executive Support`, so "what work is in most demand" would have
-      reported zero demand for org design. See the note on SERVICE_TYPES.
+      SERVICE TYPE IS NOW A CONTROLLED LIST, and the four existing rows are the argument for it: Datum's
+      Organizational Design engagement was filed as free-text `Executive Support`, so "what work is in
+      most demand" would have reported zero demand for org design. See the note on SERVICE_TYPES.
     */ ""}
     <div class="row">
       <div><label>Service Type <span class="hint">what kind of work this is — drives the demand report</span></label>${select(
@@ -335,7 +399,20 @@ function engagementForm(opts: {
     opts.peopleSection ??
     '<p class="meta">Save this first, then you can name the decision maker and the influencers on it — a role points at a real contact record, so it needs somewhere to point.</p>'
   }
+  ${opts.commitmentsSection ?? ""}
 </main>`;
+}
+
+/** The Sales Commitments section for a pursuit (0035), or undefined for a member — its forms post to
+ * /commitments, which is admin-only. */
+async function pursuitCommitments(db: Bindings["DB"], id: number): Promise<string | undefined> {
+  if (!isAdmin()) return undefined;
+  const rows = await listCommitments(db, { engagementId: id, includeClosed: true });
+  const open = rows.filter((r) => r.status === "open").length;
+  return `<section id="commitments">
+    <h2>Sales Commitments${open ? ` (${open} open)` : ""}</h2>
+    ${commitmentBlock({ engagementId: id }, rows)}
+  </section>`;
 }
 
 // ---------------------------------------------------------------- pages
@@ -349,18 +426,17 @@ const FLASH: Record<string, string> = {
   removed: '<div class="flash ok">Person removed from the pursuit.</div>',
 };
 
-/** See needsReason() — the save happened; this is the nudge, and it names the cost of skipping it. */
-const NO_REASON_FLASH =
-  '<div class="flash warn">Saved, but <b>no outcome reason was recorded</b>. A closed pursuit without one shows as <i>not recorded</i> on the demand report — and the losses are the half of that report which says what is actually wanted, as opposed to what you happened to sell.</div>';
+/** One row — a pursuit or an engagement, the two ages of the same record. Shared by every table below. */
+type EngagementRow = Engagement & { logged_hours: number | null; billable_hours?: number | null };
 
-app.get("/engagements", async (c) => {
-  const rows = await engagementList(c.env.DB);
-  const withoutQb = rows.filter((r) => r.status === "active" && !r.qb_customer_id).length;
-
-  const table = rows.length
-    ? `<table><thead><tr><th>Customer / engagement</th><th>Billing</th><th>QuickBooks</th><th style="text-align:right">Hours</th><th></th></tr></thead><tbody>${rows
-        .map(
-          (r) => `<tr>
+/**
+ * `billable` picks which of the two independent hours figures this table means (see engagementList()):
+ * Billable Hours (Client Delivery only — what feeds invoicing) for the Engagements section, or Hours
+ * (everything logged, any activity) everywhere else — Pursuits, the demand-table filter, lost pursuits.
+ */
+function engagementRow(r: EngagementRow, opts: { billable?: boolean } = {}): string {
+  const hours = opts.billable ? (r.billable_hours ?? null) : r.logged_hours;
+  return `<tr>
       <td><b>${esc(r.name)}</b>${r.organization_name ? `<div class="meta">${esc(r.organization_name)}</div>` : '<div class="meta">no customer set</div>'}
         <div class="meta"><span class="pill ${r.status === "active" ? "green" : "grey"}">${esc(
           labelFor(ENGAGEMENT_STATUSES, r.status)
@@ -379,14 +455,191 @@ app.get("/engagements", async (c) => {
           ? `<code>${esc(r.qb_customer_id)}</code>${r.qb_project_id ? `<div class="meta">project ${esc(r.qb_project_id)}</div>` : ""}`
           : '<span class="pill amber">not linked</span>'
       }</td>
-      <td style="text-align:right" data-label="Hours logged">${
-        r.logged_hours ? `<b>${esc(r.logged_hours)}</b>` : '<span class="meta">—</span>'
+      <td style="text-align:right" data-label="${opts.billable ? "Billable hours" : "Hours logged"}">${
+        hours ? `<b>${esc(hours)}</b>` : '<span class="meta">—</span>'
       }</td>
       <td class="meta rowacts"><a href="/engagements/${r.id}/edit">edit</a></td>
-    </tr>`
-        )
-        .join("")}</tbody></table>
-  <p class="meta" style="margin-top:8px">Active engagements first. <b>Hours</b> is everything logged against the engagement, all time, from <a href="/time">time entry</a>.${
+    </tr>`;
+}
+
+function engagementTable(rows: EngagementRow[], opts: { billable?: boolean } = {}): string {
+  return `<table><thead><tr><th>Customer / engagement</th><th>Billing</th><th>QuickBooks</th><th style="text-align:right">${
+    opts.billable ? "Billable Hours" : "Hours"
+  }</th><th></th></tr></thead><tbody>${rows.map((r) => engagementRow(r, opts)).join("")}</tbody></table>`;
+}
+
+/** See needsReason() — the save happened; this is the nudge, and it names the cost of skipping it. */
+const NO_REASON_FLASH =
+  '<div class="flash warn">Saved, but <b>no outcome reason was recorded</b>. A closed pursuit without one shows as <i>not recorded</i> on the demand report — and the losses are the half of that report which says what is actually wanted, as opposed to what you happened to sell.</div>';
+
+/** Vocab (if any) for labeling a filter dimension's value — service_type is free text, so it has none. */
+const FILTER_VOCAB: Partial<Record<"service_type" | "origin" | "outcome_reason", readonly (readonly [string, string])[]>> = {
+  origin: PURSUIT_ORIGINS,
+  outcome_reason: OUTCOME_REASONS,
+};
+const FILTER_TITLE: Record<"service_type" | "origin" | "outcome_reason", string> = {
+  service_type: "service type",
+  origin: "source",
+  outcome_reason: "reason it ended",
+};
+
+/** Shared page chrome so all three modes below (grouped, filtered, lost drill-in) read as one screen. */
+function engagementsPage(c: Parameters<typeof layout>[0]["c"], countLine: string, banner: string, body: string): string {
+  return `<main>
+  ${FLASH[c.req.query("flash") ?? ""] ?? ""}
+  ${c.req.query("noreason") ? NO_REASON_FLASH : ""}
+  <h1>Customers &amp; Engagements</h1>
+  <p class="meta" style="margin:0 0 4px">${countLine}</p>
+  ${banner}
+  <div class="linkbar">
+    <a class="linkchip" href="/pursuits">Pipeline</a>
+    <a class="linkchip" href="/time">Log Time</a>
+    <a class="linkchip" href="/time/report">Weekly Hours</a>
+    <a class="linkchip" href="/">Dashboard</a>
+  </div>
+  <div class="actions" style="margin:0 0 14px"><a class="btn" href="/engagements/new">New Engagement</a> <a class="btn secondary" href="/engagements/new?status=identified">New Pursuit</a></div>
+  ${body}
+</main>`;
+}
+
+/**
+ * One customer's block on the grouped view (the owner, 2026-09-22: "I would like this grouped by customer
+ * ... segmentation under each customer for pursuits vs. engagements"). Engagements first — that is the
+ * work actually happening — pursuits (open pipeline) below it. Lost pursuits are neither: they are a
+ * link, not a table, so a customer's current picture is not buried under everything that never went
+ * anywhere. See deadPursuitsForOrg() for what that link opens.
+ */
+function customerGroup(g: {
+  organizationId: number | null;
+  organizationName: string | null;
+  engagements: EngagementRow[];
+  pursuits: EngagementRow[];
+  lostCount: number;
+}): string {
+  return `<section class="card" style="margin-bottom:16px">
+    <h2 style="margin-top:0">${g.organizationName ? esc(g.organizationName) : '<span class="meta">No customer set</span>'}</h2>
+    ${
+      g.engagements.length
+        ? `<h3 class="meta" style="margin:0 0 6px">Engagements</h3>${engagementTable(g.engagements, { billable: true })}`
+        : ""
+    }
+    ${
+      g.pursuits.length
+        ? `<h3 class="meta" style="margin:16px 0 6px">Pursuits</h3>${engagementTable(g.pursuits)}`
+        : ""
+    }
+    ${!g.engagements.length && !g.pursuits.length ? '<p class="meta">No open pursuits or active engagements — only lost ones.</p>' : ""}
+    ${
+      g.lostCount
+        ? `<p class="meta" style="margin-top:12px"><a href="/engagements?organization_id=${g.organizationId}&status=lost">${g.lostCount} lost pursuit${g.lostCount === 1 ? "" : "s"} →</a></p>`
+        : ""
+    }
+  </section>`;
+}
+
+app.get("/engagements", async (c) => {
+  // At most one of these is ever set — a demand-table heading links here with exactly one query param.
+  const filterColumn = (["service_type", "origin", "outcome_reason"] as const).find(
+    (col) => c.req.query(col) !== undefined
+  );
+  const filter = filterColumn ? { column: filterColumn, value: str(c.req.query(filterColumn) ?? "") } : undefined;
+
+  const orgIdParam = c.req.query("organization_id");
+  const organizationId = orgIdParam && /^\d+$/.test(orgIdParam) ? Number(orgIdParam) : null;
+  const lostDrillIn = organizationId !== null && c.req.query("status") === "lost";
+
+  // ---------------------------------------------------------------- lost-pursuits drill-in
+  if (lostDrillIn) {
+    const rows = await deadPursuitsForOrg(c.env.DB, organizationId!);
+    const orgName = rows[0]?.organization_name ?? null;
+    const body = rows.length
+      ? engagementTable(rows)
+      : '<div class="card empty">Nothing here — the link that brought you must be stale.</div>';
+    return c.html(
+      layout({ c,
+        title: "Lost Pursuits",
+        body: engagementsPage(
+          c,
+          `${rows.length} lost pursuit${rows.length === 1 ? "" : "s"}${orgName ? ` — ${esc(orgName)}` : ""}`,
+          `<p class="meta" style="margin:0 0 12px"><a href="/engagements">← all customers</a></p>`,
+          body
+        ),
+      })
+    );
+  }
+
+  // ---------------------------------------------------------------- filtered flat list (demand-table click-through)
+  if (filter) {
+    const rows = await engagementList(c.env.DB, filter);
+    const withoutQb = rows.filter((r) => r.status === "active" && !r.qb_customer_id).length;
+    const banner = `<p class="meta" style="margin:0 0 12px">Filtered to ${esc(FILTER_TITLE[filter.column])}: <b>${esc(
+      filter.value === null
+        ? "not recorded"
+        : FILTER_VOCAB[filter.column]
+          ? labelFor(FILTER_VOCAB[filter.column]!, filter.value)
+          : filter.value
+    )}</b> — from the <a href="/pursuits">Pursuits</a> demand report. <a href="/engagements">Clear filter</a>.</p>`;
+    const body = rows.length
+      ? `${engagementTable(rows)}
+  <p class="meta" style="margin-top:8px"><b>Hours</b> is everything logged against the engagement, all time, from <a href="/time">time entry</a>.${
+    withoutQb
+      ? ` <b>${withoutQb} active engagement${withoutQb === 1 ? "" : "s"} ${
+          withoutQb === 1 ? "has" : "have"
+        } no QuickBooks id</b>, so ${withoutQb === 1 ? "its" : "their"} hours cannot be reconciled to an invoice.`
+      : ""
+  }</p>`
+      : `<div class="card empty"><p><b>Nothing matches that filter.</b> <a href="/engagements">Clear it</a> to see every engagement.</p></div>`;
+    return c.html(
+      layout({ c,
+        title: "Engagements",
+        body: engagementsPage(c, `${rows.length} engagement${rows.length === 1 ? "" : "s"}`, banner, body),
+      })
+    );
+  }
+
+  // ---------------------------------------------------------------- default: grouped by customer
+  const rows = await engagementList(c.env.DB);
+  const withoutQb = rows.filter((r) => r.status === "active" && !r.qb_customer_id).length;
+
+  const groups = new Map<
+    string,
+    {
+      organizationId: number | null;
+      organizationName: string | null;
+      engagements: EngagementRow[];
+      pursuits: EngagementRow[];
+      lostCount: number;
+    }
+  >();
+  for (const r of rows) {
+    const key = r.organization_id === null ? "none" : String(r.organization_id);
+    if (!groups.has(key))
+      groups.set(key, {
+        organizationId: r.organization_id,
+        organizationName: r.organization_name ?? null,
+        engagements: [],
+        pursuits: [],
+        lostCount: 0,
+      });
+    const g = groups.get(key)!;
+    if (isPursuit(r.status)) g.pursuits.push(r);
+    else if (isLive(r.status) || r.status === "complete") g.engagements.push(r);
+    else g.lostCount++; // isDead — lost, no_decision, withdrawn
+  }
+  // Alphabetical by customer; "no customer set" (organizationName null) sorts last rather than first.
+  const sorted = [...groups.values()].sort((a, b) => {
+    if (a.organizationName === null) return b.organizationName === null ? 0 : 1;
+    if (b.organizationName === null) return -1;
+    return a.organizationName.localeCompare(b.organizationName);
+  });
+
+  const openPursuits = rows.filter((r) => isPursuit(r.status)).length;
+  const liveEngagements = rows.filter((r) => isLive(r.status) || r.status === "complete").length;
+  const countLine = `${sorted.length} customer${sorted.length === 1 ? "" : "s"} · ${liveEngagements} engagement${liveEngagements === 1 ? "" : "s"} · ${openPursuits} open pursuit${openPursuits === 1 ? "" : "s"}`;
+
+  const body = rows.length
+    ? `${sorted.map(customerGroup).join("")}
+  <p class="meta">Active engagements first within each customer. Two independent hours figures, from <a href="/time">time entry</a>: under Engagements, <b>Billable Hours</b> is Client Delivery time only — what actually feeds an invoice; under Pursuits, <b>Hours</b> is everything logged against that pursuit, any activity — the cost of chasing the work, win or lose.${
     withoutQb
       ? ` <b>${withoutQb} active engagement${withoutQb === 1 ? "" : "s"} ${
           withoutQb === 1 ? "has" : "have"
@@ -400,23 +653,16 @@ app.get("/engagements", async (c) => {
   </div>`;
 
   return c.html(
-    layout({
+    layout({ c,
       title: "Engagements",
-      body: `<main>
-  ${FLASH[c.req.query("flash") ?? ""] ?? ""}
-  ${c.req.query("noreason") ? NO_REASON_FLASH : ""}
-  <h1>Customers &amp; Engagements</h1>
-  <p class="sub">${rows.length} engagement${rows.length === 1 ? "" : "s"} · <a href="/pursuits">pipeline</a> · <a href="/time">log time</a> · <a href="/time/report">weekly hours</a> · <a href="/">dashboard</a></p>
-  <div class="actions" style="margin:0 0 14px"><a class="btn" href="/engagements/new">New Engagement</a> <a class="btn secondary" href="/engagements/new?status=identified">New Pursuit</a></div>
-  ${table}
-</main>`,
+      body: engagementsPage(c, countLine, "", body),
     })
   );
 });
 
 app.get("/engagements/new", async (c) =>
   c.html(
-    layout({
+    layout({ c,
       title: "New Engagement",
       body: engagementForm({
         orgNames: await orgNames(c.env.DB),
@@ -449,7 +695,7 @@ app.get("/engagements/:id/edit", async (c) => {
   if (!row) return c.notFound();
   const peopleRows = await peopleOptions(c.env.DB);
   return c.html(
-    layout({
+    layout({ c,
       title: `Edit ${row.name}`,
       body: (FLASH[c.req.query("flash") ?? ""] ?? "") +
         (c.req.query("noreason") ? NO_REASON_FLASH : "") +
@@ -465,6 +711,7 @@ app.get("/engagements/:id/edit", async (c) => {
           peopleRows,
           error: PEOPLE_FLASH[c.req.query("people") ?? ""],
         }),
+        commitmentsSection: await pursuitCommitments(c.env.DB, id),
       }),
     })
   );
@@ -670,7 +917,7 @@ function values(
  *
  * EVERY FIELD THAT CAN BE EDITED HAS TO APPEAR HERE. It is the comparison the edit route makes to decide
  * whether anything happened, so a field left out of this string is a field whose change is reported to
- * the user as "nothing changed, so nothing was saved" — while having been saved. PURS-001 added ten
+ * The owner as "nothing changed, so nothing was saved" — while having been saved. PURS-001 added ten
  * editable fields and this is where they earn their place.
  */
 const summary = (e: ParsedEngagement, org: string | null) =>
@@ -717,7 +964,7 @@ app.post("/engagements/new", async (c) => {
   const peopleRows = await peopleOptions(c.env.DB);
   const reshow = async (error: string) =>
     c.html(
-      layout({
+      layout({ c,
         title: "New Engagement",
         body: engagementForm({
           orgNames: await orgNames(c.env.DB),
@@ -764,7 +1011,7 @@ app.post("/engagements/:id/edit", async (c) => {
   const peopleRows = await peopleOptions(c.env.DB);
   const reshow = async (error: string) =>
     c.html(
-      layout({
+      layout({ c,
         title: "Edit Engagement",
         body: engagementForm({
           orgNames: await orgNames(c.env.DB),
@@ -777,6 +1024,7 @@ app.post("/engagements/:id/edit", async (c) => {
             people: await pursuitPeople(c.env.DB, id),
             peopleRows,
           }),
+          commitmentsSection: await pursuitCommitments(c.env.DB, id),
         }),
       })
     );

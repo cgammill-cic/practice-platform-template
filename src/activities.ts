@@ -1,10 +1,9 @@
-// The activity vocabulary, as data (migration 0026).
+// The activity vocabulary, as data (migration 0026, the owner 2026-09-09).
 //
-// The goal: let the application offer to create a new category when one has been added in Outlook, and
-// ask how to apply it, rather than rejecting it outright. See the migration for the full argument; the
-// short version is that a value in a real table needs no schema rebuild, so adding one is exactly as safe
-// (an unrecognized activity still fails loudly, via a foreign key instead of a CHECK) and costs no
-// migration.
+// "Can I have the application create a new category when I've added it to Outlook, but ask me how to
+// apply it in the app?" See the migration for the full argument; the short version is that a value in a
+// real table needs no schema rebuild, so adding one is exactly as safe (an unrecognized activity still
+// fails loudly, via a foreign key instead of a CHECK) and costs no migration.
 //
 // "ASK ME HOW TO APPLY IT" is answered by one question: does this count as worked hours? That is the one
 // axis every report in this app actually branches on (time.ts's "hours worked" total, the dashboard's
@@ -15,9 +14,9 @@
 import { Hono } from "hono";
 import { esc, layout } from "./views";
 import type { Bindings, D1Db } from "./types";
+import { actor } from "./auth";
 
 const app = new Hono<{ Bindings: Bindings }>();
-const ACTOR = "operator";
 
 export interface ActivityRow {
   name: string;
@@ -56,7 +55,7 @@ async function audit(db: D1Db, name: string, action: string, after: string, befo
     .prepare(
       "INSERT INTO audit_event (actor, entity, entity_id, action, before_summary, after_summary, source, correlation_id) VALUES (?,'activity',?,?,?,?,'app',?)"
     )
-    .bind(ACTOR, name, action, before ?? null, after, `activity-${name}`)
+    .bind(actor(), name, action, before ?? null, after, `activity-${name}`)
     .run();
 }
 
@@ -106,7 +105,7 @@ app.get("/activities", async (c) => {
   const flashHtml = flash && FLASH[flash] ? `<div class="flash ${flash === "inuse" ? "warn" : "ok"}">${esc(FLASH[flash])}</div>` : "";
 
   return c.html(
-    layout({
+    layout({ c,
       title: "Activities",
       body: `<main>
   <h1>Activities</h1>

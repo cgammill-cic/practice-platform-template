@@ -2,8 +2,9 @@
  * M365-001 part 2 — the calendar import (#99).
  *
  * Reads a week of Outlook events and proposes time entries. PREVIEW, ADJUST, APPROVE: nothing is written
- * until the approve button is pressed, and every proposal is editable on the way through — the
- * recurring requirement was to review, adjust, and only then approve or finalize.
+ * until the approve button is pressed, and every proposal is editable on the way through. The owner,
+ * 2026-08-11: "I would like it to import, but I need to review, have the ability to adjust, and then
+ * approve/finalize."
  *
  * ON DEMAND, NOT CONTINUOUS. "I don't need that to run until the end of the week... I do not need to know
  * the time count until the week is over." So there are no change notifications, no webhook and no
@@ -13,18 +14,18 @@
  * WHY THIS IS A PROPOSAL AND NOT AN IMPORT
  * ---------------------------------------
  * A calendar is a claim about where time went, not a record of it. Meetings run over, get cancelled without
- * being deleted, and whole afternoons of work never appear. Three things a real Outlook calendar can
- * produce make that concrete, and each one is handled explicitly below rather than averaged away:
+ * being deleted, and whole afternoons of work never appear. Three things in the owner's real calendar make
+ * that concrete, and each one is handled explicitly below rather than averaged away:
  *
- *   - a large share of events in a given week can carry no category at all
- *   - a "quick call" event can fully CONTAIN a longer working session, so summing durations overstates
- *     the actual time worked
- *   - a typo'd category (e.g. a misspelled client name) would become a customer called that, because the
- *     client-tag convention is a bare company name (definitions.md §5a)
+ *   - 18 of 33 events in one week carried no category at all (read 2026-08-11)
+ *   - `Potential Brack in town` (08:30–12:00) fully CONTAINS a two-hour working session, so summing
+ *     durations reports 5.5 hours for a 3.5-hour window
+ *   - `Client Deliverry` — a plausible typo — would become a customer called that, because the client-tag
+ *     convention is a bare company name (definitions.md §5a)
  *
- * THE ACCURACY BUDGET IS NOT EVEN. A billable client row becomes an invoice, so an error there reaches
- * somebody else's money; everything else is the operator looking at their own week. Rows that would bill
- * are marked, and the ones that cannot be attributed are refused rather than guessed at.
+ * THE ACCURACY BUDGET IS NOT EVEN. Client Delivery becomes an invoice, so an error there reaches somebody
+ * else's money; everything else is the owner looking at his own week. Rows that would bill are marked, and
+ * the ones that cannot be attributed are refused rather than guessed at.
  */
 
 import { Hono } from "hono";
@@ -33,10 +34,11 @@ import { pickableEngagements } from "./engagements";
 import { graphBase, msAccessToken, msConnection } from "./msgraph";
 import { esc, layout, select } from "./views";
 import { BILLABLE_ACTIVITY, type Bindings, type D1Db } from "./types";
-import { shiftWeek, weekBounds } from "./weeks";
+import { currentZone, shiftWeek, weekBounds } from "./weeks";
+import { WINDOWS_TO_IANA } from "./mailimport";
+import { actor } from "./auth";
 
 const app = new Hono<{ Bindings: Bindings }>();
-const ACTOR = "operator";
 const today = () => new Date().toISOString().slice(0, 10);
 
 /** Graph's shape, only the fields used. Anything else in the payload is ignored rather than modelled. */
@@ -83,10 +85,10 @@ export interface ProposedEntry {
   engagement_label: string | null;
   location: string | null;
   /**
-   * The operator's comment, if this event has been imported before. Carried into the preview so
-   * re-importing a week shows what was already written and round-trips it back untouched — the
-   * alternative is a blank box that silently erases the comment on approve, which is exactly the
-   * failure this field was added to fix (migration 0017).
+   * The owner's comment, if this event has been imported before. Carried into the preview so re-importing a
+   * week shows what he already wrote and round-trips it back untouched — the alternative is a blank box
+   * that silently erases the comment on approve, which is exactly the failure this field was added to fix
+   * (migration 0017).
    */
   comment: string | null;
   flags: FlagKind[];
@@ -153,8 +155,7 @@ const BLOCKING: FlagKind[] = [
 /*
  * THE FALLBACK TIMEZONE, when Graph will not say what the mailbox uses.
  *
- * Set to Central because that is the fallback that matched the operator's own mailbox setting when this
- * was written — a deployment with a different home timezone should update this constant to match.
+ * The owner, 2026-08-13: "Let's have the assumed Timezone be CT (I looked at outlook and it was set to CT)."
  *
  * WINDOWS NAME, NOT IANA — `America/Chicago` would be the modern spelling, but `/me/mailboxSettings`
  * returns Windows names ("Central Standard Time"), and this value goes into the same `Prefer:
@@ -174,8 +175,7 @@ const FALLBACK_TIMEZONE = "Central Standard Time";
  *
  * Graph returns UTC unless asked otherwise, and an evening event in Central is the next day in UTC — which
  * would silently move hours between weeks at the boundary. Asked of the mailbox first rather than assumed:
- * that is one call, and it is what makes this correct for anyone whose working timezone is not the
- * fallback above (PKG-001).
+ * that is one call, and it is what makes this correct for anyone who is not the owner (PKG-001).
  *
  * WHEN THAT CALL FAILS, CENTRAL IS A BETTER GUESS THAN UTC — and the previous version guessed UTC, which
  * is nobody's actual working day. UTC is only the honest answer if the alternative is a fabrication; here
@@ -189,11 +189,13 @@ const FALLBACK_TIMEZONE = "Central Standard Time";
  * back, which is real machinery to replace a value the mailbox already answers correctly and a constant
  * covers when it does not.
  */
-async function resolveTimeZone(
+export async function resolveTimeZone(
   env: Bindings,
   token: string
 ): Promise<{ tz: string; fromMailbox: boolean }> {
-  const fallback = { tz: env.MS_TIMEZONE ?? FALLBACK_TIMEZONE, fromMailbox: false };
+  // Phase 3a: the copy's own timezone setting, in the Windows vocabulary when it has one.
+  const own = Object.entries(WINDOWS_TO_IANA).find(([, iana]) => iana === currentZone())?.[0];
+  const fallback = { tz: env.MS_TIMEZONE ?? own ?? FALLBACK_TIMEZONE, fromMailbox: false };
   try {
     const res = await fetch(`${graphBase(env)}/me/mailboxSettings`, {
       headers: { authorization: `Bearer ${token}` },
@@ -263,21 +265,20 @@ export async function proposeWeek(
   engagements: { id: number; label: string }[]
 ): Promise<ProposedEntry[]> {
   // Organization name → active engagement, for matching a client category. Lowercased for comparison
-  // because Outlook categories are typed by hand and casing varies for what is otherwise the same customer.
+  // because Outlook categories are typed by hand and "INITECH" / "Initech" are the same customer.
   /*
    * MATCH ON `calendar_tag` FIRST, FALLING BACK TO THE ORGANIZATION NAME (migration 0018).
    *
-   * Nobody types a legal entity name into a calendar category. The operator writes the short name they
-   * know a client by; the organization record carries the full legal name. Both are correct — the invoice
-   * needs the long one, the category wants the short one — so the platform holds both rather than forcing
-   * either to be wrong.
+   * Nobody types a legal entity name into a calendar category. The owner writes `Datum`; the organization is
+   * `Datum Engineers, Inc.` Both are correct — the invoice needs the long one, the category wants the short
+   * one — so the platform holds both rather than forcing either to be wrong.
    *
    * The name is still matched when no tag is set, so every organization that already worked keeps working
-   * with no data entry. A category that already matches an organization's plain name needs no tag at all.
+   * with no data entry. `Initech` matching an organization called `Initech` needs no tag at all.
    *
    * AND `status <> 'complete'`, NOT `status = 'active'` — same reasoning as pickableEngagements(). A
    * prospective engagement is exactly what Business Development hours attach to; refusing to match one
-   * meant a freshly created customer's calendar rows came back as "no engagement" for that customer.
+   * meant the owner's Datum row came back as "no engagement" for a customer he had just created.
    */
   const { results: orgRows } = await db
     .prepare(
@@ -320,7 +321,7 @@ export async function proposeWeek(
   }
 
   /*
-   * Rows a previous import created, with whatever the operator has since written on them. Only `source =
+   * Rows a previous import created, with whatever the owner has since written on them. Only `source =
    * 'calendar'` rows are read: a hand-typed entry that happens to carry an outlook_ref is not this
    * import's to update, so pulling its comment into the preview would put someone else's words in a box
    * that then writes them to a different row.
@@ -382,7 +383,7 @@ export async function proposeWeek(
     if (ev.isCancelled) flags.push("cancelled");
     if ((ev.showAs ?? "busy") === "free") flags.push("free");
     if (already.has(ev.id)) flags.push("already_imported");
-    // A row the operator has since corrected. Flagged AND blocking, so re-importing a week never quietly
+    // A row the owner has since corrected. Flagged AND blocking, so re-importing a week never quietly
     // reverts a correction to hours that may be on an invoice (migration 0019).
     if (already.get(ev.id)?.hand_edited) flags.push("hand_edited");
 
@@ -407,11 +408,10 @@ export async function proposeWeek(
 
   /*
    * OVERLAPS. Flagged on BOTH events, not just the later one — neither is more wrong than the other, and
-   * which of the two is the real block is the operator's call. Compared within a day, after sorting by
-   * start.
+   * which of the two is the real block is the owner's call. Compared within a day, after sorting by start.
    *
-   * This is the check that stops the import overbilling. A shorter working session fully contained inside
-   * a longer calendar block would otherwise have both durations summed, overstating the actual time spent.
+   * This is the check that stops the import overbilling. On 13 August a 3.5-hour window fully contains a
+   * 2-hour session; summing both reports 5.5 hours for 3.5 hours of time.
    */
   const byDay = new Map<string, ProposedEntry[]>();
   for (const p of proposals) {
@@ -460,7 +460,7 @@ const fmtH = (n: number) => {
 /*
  * A HEADING ROW PER DAY, CARRYING THAT DAY'S HOURS.
  *
- * Added on request: it should be easy to see the total number of hours in the batch for each day.
+ * The owner, 2026-08-13: "it would be good to see the total number of hours in the batch for each day."
  *
  * TWO NUMBERS, NOT ONE, because they are different questions and on a real week they disagree. "On the
  * calendar" is every event that day; "ticked" is what pressing the button would actually record. A single
@@ -469,10 +469,9 @@ const fmtH = (n: number) => {
  * behind. Shown side by side, the gap IS the information — it is the day's unresolved time.
  *
  * AND THE CALENDAR TOTAL IS MARKED WHEN IT LIES. On a day containing an overlap, summing durations counts
- * the same clock time twice — an overlapping pair of events can sum to well more hours than the actual
- * window they occupy. Presenting that inflated total as "hours on the calendar" with no qualifier would
- * be the double-count wearing the costume of a total, on a page whose whole job is to stop exactly that
- * reaching an invoice.
+ * the same clock time twice — 13 Aug in the owner's own calendar sums to 5.5 hours for a 3.5-hour window.
+ * Presenting 5.5 as "hours on the calendar" with no qualifier would be the double-count wearing the
+ * costume of a total, on a page whose whole job is to stop exactly that reaching an invoice.
  */
 function dayHeader(date: string, rows: ProposedEntry[]): string {
   const all = rows.reduce((n, p) => n + p.hours, 0);
@@ -556,7 +555,7 @@ app.get("/time/import", async (c) => {
     <a href="/time?week=${esc(anchor)}">time entry</a> · <a href="/health">connection</a></p>`;
 
   const shell = (body: string) =>
-    c.html(layout({ title: "Import from Outlook", body: `<main><h1>Import from Outlook</h1>${nav}${body}</main>` }));
+    c.html(layout({ title: "Import from Outlook", body: `<main><h1>Import from Outlook</h1>${nav}${body}</main>`, c }));
 
   if (!conn)
     return shell(
@@ -594,7 +593,7 @@ app.get("/time/import", async (c) => {
     );
 
   /*
-   * "ASK HOW TO APPLY IT" (2026-09-09, migration 0026). An `unknown_activity` row's single
+   * "ASK ME HOW TO APPLY IT" (the owner, 2026-09-09, migration 0026). An `unknown_activity` row's single
    * non-activity category IS the candidate name — see proposeWeek()'s comment on why a misspelled
    * activity and a new client category look identical by shape. Offered once per distinct name, not once
    * per event: a whole week of Vacation/Holiday days would otherwise repeat the same prompt daily.
@@ -772,9 +771,8 @@ app.post("/time/import", async (c) => {
     if (existing) {
       /*
        * THE SUBJECT AND THE COMMENT GO TO DIFFERENT COLUMNS (migration 0017). `subject` is the calendar's
-       * words and is refreshed from Outlook every time; `note` is the operator's and is only ever what the
-       * box on this page held — which was prefilled with what was written before, so a re-import
-       * round-trips it.
+       * words and is refreshed from Outlook every time; `note` is the owner's and is only ever what the box
+       * on this page held — which was prefilled with what he wrote before, so a re-import round-trips it.
        *
        * The prefill is what makes the write safe. Writing a blank straight over an existing comment would
        * be the bug this field exists to prevent, so if the box came back empty AND the row already has a
@@ -783,7 +781,7 @@ app.post("/time/import", async (c) => {
        * lost a field than a deliberate deletion.
        */
       /*
-       * A ticked row that the operator had corrected is an OVERRIDE, and the mark is cleared (migration 0019).
+       * A ticked row that the owner had corrected is an OVERRIDE, and the mark is cleared (migration 0019).
        *
        * The row arrived unticked and labelled "you corrected this" — `hand_edited` is in BLOCKING — so a
        * tick here cannot be inertia. It is the deliberate instruction to take Outlook's version back, and
@@ -805,7 +803,7 @@ app.post("/time/import", async (c) => {
           "INSERT INTO audit_event (actor, entity, entity_id, action, after_summary, source) VALUES (?,'time_entry',?,'update',?, 'calendar-import')"
         )
           .bind(
-            ACTOR,
+            actor(),
             String(existing.id),
             `${hours}h ${activity} on ${date} — your correction was deliberately replaced with Outlook's version on re-import (${subject})`
           )
@@ -823,7 +821,7 @@ app.post("/time/import", async (c) => {
         "INSERT INTO audit_event (actor, entity, entity_id, action, after_summary, source) VALUES (?,'time_entry',?,'create',?, 'calendar-import')"
       )
         .bind(
-          ACTOR,
+          actor(),
           String(id),
           `${hours}h ${activity} on ${date} — imported from Outlook: ${subject}${comment ? ` — ${comment}` : ""}`
         )
@@ -841,7 +839,7 @@ app.post("/time/import", async (c) => {
     await c.env.DB.prepare(
       "INSERT INTO audit_event (actor, entity, entity_id, action, after_summary, source) VALUES (?,'time_entry',?,'update',?, 'calendar-import')"
     )
-      .bind(ACTOR, `week-${week}`, `Outlook import for the week of ${week}: ${created} created, ${updated} updated`)
+      .bind(actor(), `week-${week}`, `Outlook import for the week of ${week}: ${created} created, ${updated} updated`)
       .run();
 
   const params = new URLSearchParams({ week });

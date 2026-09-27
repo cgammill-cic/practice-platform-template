@@ -2,9 +2,9 @@
  * REL-017 — the contact list and its search.
  * REL-019 — deleting a contact, with guardrails.
  *
- * Replaces the single cramped search box that shipped with REL-002. The reported problem, 2026-07-30:
- * there were two boxes, one very small and the other pulling from the status field, when what was
- * actually wanted was the ability to search by name, title, company, and department.
+ * Replaces the single cramped search box that shipped with REL-002. The owner's report 2026-07-30:
+ * "there are two boxes, one is really small and the other is pulling from the status field... I'd
+ * like to be able to search by name, title, company, department."
  *
  * The old bar had an unlabelled text input beside a bare stage dropdown, so there was no way to tell
  * what either did. The free-text box DID already search names — it just did not look like it. That is
@@ -16,7 +16,7 @@
  */
 
 import { Hono } from "hono";
-import { esc, followUpPill, layout, select } from "./views";
+import { esc, followUpPill, layout, priorityBadge, select, stageDotClass } from "./views";
 import {
   DEPARTMENTS,
   MAX_PRIORITY_TIER,
@@ -27,10 +27,10 @@ import {
   type Bindings,
   type Contact,
 } from "./types";
+import { actor } from "./auth";
 
 const app = new Hono<{ Bindings: Bindings }>();
 const LIMIT = 300;
-const ACTOR = "operator";
 
 /** contact.created_at is the import timestamp for imported rows — see the Added column. */
 interface Row {
@@ -41,6 +41,7 @@ interface Row {
   department: string | null;
   stage: string;
   priority_tier: number | null;
+  is_priority: number;
   last_touch: string | null;
   next_follow_up: string | null;
   email_work: string | null;
@@ -61,12 +62,14 @@ app.get("/contacts", async (c) => {
   const tier = c.req.query("tier") ?? "";
   const src = c.req.query("src") ?? "";
   const showInactive = c.req.query("inactive") === "1";
+  const priorityOnly = c.req.query("priority") === "1";
   const sort = c.req.query("sort") ?? "name";
   const flash = c.req.query("flash");
 
   const where: string[] = [];
   const params: unknown[] = [];
   if (!showInactive) where.push("c.status = 'active'");
+  if (priorityOnly) where.push("c.is_priority = 1");
   if (stage) {
     where.push("c.stage = ?");
     params.push(stage);
@@ -112,7 +115,7 @@ app.get("/contacts", async (c) => {
   const orderBy = ORDER[sort] ?? ORDER.name;
 
   const sql = `SELECT c.id, c.full_name, c.title, o.name AS organization_name, c.department, c.stage,
-      c.priority_tier, c.last_touch, c.next_follow_up, c.email_work, c.email_personal, c.linkedin_url,
+      c.priority_tier, c.is_priority, c.last_touch, c.next_follow_up, c.email_work, c.email_personal, c.linkedin_url,
       c.source, c.status, c.created_at
     FROM contact c LEFT JOIN organization o ON o.id = c.organization_id
     ${where.length ? "WHERE " + where.join(" AND ") : ""}
@@ -128,10 +131,10 @@ app.get("/contacts", async (c) => {
     "SELECT name FROM organization ORDER BY name LIMIT 600"
   ).all<{ name: string }>();
 
-  const filtersActive = Boolean(q || org || dept || stage || tier || src || showInactive);
+  const filtersActive = Boolean(q || org || dept || stage || tier || src || showInactive || priorityOnly);
   const keep = (extra: Record<string, string>) => {
     const p = new URLSearchParams();
-    const base: Record<string, string> = { q, org, dept, stage, tier, src, ...(showInactive ? { inactive: "1" } : {}) };
+    const base: Record<string, string> = { q, org, dept, stage, tier, src, ...(showInactive ? { inactive: "1" } : {}), ...(priorityOnly ? { priority: "1" } : {}) };
     for (const [k, v] of Object.entries({ ...base, ...extra })) if (v) p.set(k, v);
     return `/contacts?${p.toString()}`;
   };
@@ -148,16 +151,16 @@ app.get("/contacts", async (c) => {
     .map((r) => {
       const email = r.email_work || r.email_personal;
       return `<tr>
-      <td><a href="/contacts/${r.id}"><b>${esc(r.full_name)}</b></a>
+      <td><a href="/contacts/${r.id}"><b>${esc(r.full_name)}</b></a> ${priorityBadge(r)}
         ${r.title ? `<div class="meta">${esc(r.title)}</div>` : ""}
         ${email ? `<div class="meta"><a href="mailto:${esc(email)}">${esc(email)}</a></div>` : ""}
         ${r.status !== "active" ? '<span class="pill grey">inactive</span>' : ""}</td>
       <td data-label="Organization">${esc(r.organization_name ?? "—")}${r.department ? `<div class="meta">${esc(r.department)}</div>` : ""}</td>
-      <td data-label="Stage"><span class="pill grey">${esc(stageLabel(r.stage))}</span>
+      <td data-label="Stage"><span class="stagewrap"><span class="dot ${stageDotClass(r.stage)}"></span>${esc(stageLabel(r.stage))}</span>
         ${r.priority_tier ? `<div class="meta">Tier ${r.priority_tier}</div>` : ""}</td>
-      <td data-label="Last touch">${esc(r.last_touch ?? "—")}</td>
+      <td data-label="Last touch" class="mono">${esc(r.last_touch ?? "—")}</td>
       <td data-label="Next follow-up">${followUpPill(r.next_follow_up, r.stage)}</td>
-      <td class="meta" data-label="Added">${esc((r.created_at ?? "").slice(0, 10) || "—")}<div>${esc(labelFor(SOURCES, r.source))}</div></td>
+      <td class="meta" data-label="Added"><span class="mono">${esc((r.created_at ?? "").slice(0, 10) || "—")}</span><div>${esc(labelFor(SOURCES, r.source))}</div></td>
       <td class="meta rowacts">${r.linkedin_url ? `<a href="${esc(r.linkedin_url)}" target="_blank" rel="noopener">LI ↗</a> · ` : ""}<a href="/contacts/${r.id}/edit">edit</a> · <a href="/contacts/${r.id}/delete">delete</a></td>
     </tr>`;
     })
@@ -180,18 +183,22 @@ app.get("/contacts", async (c) => {
       }</div>`;
 
   return c.html(
-    layout({
+    layout({ c,
       title: "Contacts",
       body: `<main>
   ${flashHtml}
   <h1>Contacts</h1>
-  <p class="sub">${total} match${total === 1 ? "" : "es"}${
+  <p class="meta" style="margin:0 0 4px">${total} match${total === 1 ? "" : "es"}${
         total > results.length ? ` · showing the first ${results.length}` : ""
-      }${filtersActive ? ` · <a href="/contacts">clear filters</a>` : ""} · <a href="/export/contacts.csv">export all to CSV</a></p>
+      }</p>
+  <div class="linkbar">
+    ${filtersActive ? '<a class="linkchip" href="/contacts">Clear Filters</a>' : ""}
+    <a class="linkchip" href="/export/contacts.csv">Export to CSV</a>
+  </div>
 
   <form class="card" method="get" action="/contacts">
     <label>Name, title, organization, department, email, notes or tag</label>
-    <input type="text" name="q" value="${esc(q)}" placeholder="e.g. Smith, or CHRO, or Acme Corp" autofocus>
+    <input type="text" name="q" value="${esc(q)}" placeholder="e.g. Smith, or CHRO, or Acme" autofocus>
     <div class="row">
       <div><label>Organization</label>
         <input type="text" name="org" list="orglist" value="${esc(org)}" placeholder="any">
@@ -208,6 +215,7 @@ app.get("/contacts", async (c) => {
       <div><label>Priority Tier</label>${select("tier", TIERS, tier, { blank: "Any tier" })}</div>
       <div><label>Source</label>${select("src", SOURCES, src, { blank: "Any source" })}</div>
     </div>
+    <label class="check"><input type="checkbox" name="priority" value="1"${priorityOnly ? " checked" : ""}> ★ Priority contacts only</label>
     <label class="check"><input type="checkbox" name="inactive" value="1"${showInactive ? " checked" : ""}> Include inactive contacts</label>
     <div class="actions">
       <button type="submit">Search</button>
@@ -298,7 +306,7 @@ app.get("/contacts/:id/delete", async (c) => {
   ].filter(Boolean);
 
   return c.html(
-    layout({
+    layout({ c,
       title: `Delete ${contact.full_name}`,
       body: `<main>
   <h1>Delete ${esc(contact.full_name)}?</h1>
@@ -379,7 +387,7 @@ app.post("/contacts/:id/inactivate", async (c) => {
     `INSERT INTO audit_event (actor, entity, entity_id, action, before_summary, after_summary, source)
      VALUES (?,?,?,?,?,?, 'app')`
   )
-    .bind(ACTOR, "contact", String(id), "update", `status ${before.status}`, `status inactive — ${before.full_name}`)
+    .bind(actor(), "contact", String(id), "update", `status ${before.status}`, `status inactive — ${before.full_name}`)
     .run();
   return c.redirect("/contacts?flash=inactivated");
 });
@@ -440,7 +448,7 @@ app.post("/contacts/:id/delete", async (c) => {
      )`
   )
     .bind(
-      ACTOR,
+      actor(),
       "contact",
       String(id),
       "delete",
@@ -483,7 +491,7 @@ app.post("/contacts/:id/delete", async (c) => {
          )`
       )
         .bind(
-          ACTOR,
+          actor(),
           "action_item",
           String(a.id),
           "delete",
@@ -536,7 +544,7 @@ app.post("/contacts/:id/delete", async (c) => {
        )`
     )
       .bind(
-        ACTOR,
+        actor(),
         "engagement_contact",
         String(id),
         "delete",
@@ -556,7 +564,7 @@ app.post("/contacts/:id/delete", async (c) => {
    *
    * Detached rather than deleted because the column is nullable and the row is BILLABLE TIME. Hours
    * are the invoicing record (definitions.md §5c); deleting a bad contact record must never quietly
-   * remove hours the operator worked, and of every silent loss in this app that is the one that reaches
+   * remove hours the owner worked, and of every silent loss in this app that is the one that reaches
    * somebody else's money. The engagement, date, activity and hours all survive; only the optional
    * link to a person is cleared. Zero rows are affected in production today — every time_entry so far
    * came from the calendar import with no contact attached — which is exactly why this had to be
@@ -581,7 +589,7 @@ app.post("/contacts/:id/delete", async (c) => {
        )`
     )
       .bind(
-        ACTOR,
+        actor(),
         "time_entry",
         String(id),
         "update",
@@ -597,21 +605,21 @@ app.post("/contacts/:id/delete", async (c) => {
   /*
    * Stage history has to go before the contact does (REL-031, 2026-08-20).
    *
-   * THIS WAS A LIVE OUTAGE. Migration 0020 (2026-08-18) added contact_stage_event plus a
-   * contact_stage_initial trigger that fires AFTER INSERT, so from that moment EVERY contact carries at
-   * least one stage-history row. contact_stage_event.contact_id is `NOT NULL REFERENCES contact(id)`
-   * with no ON DELETE CASCADE, and this delete path was never taught about the new table — so the
-   * DELETE below aborted on a foreign key violation and the route returned a 500. The overwhelming
-   * majority of contacts were undeletable as a result; only a small number of records that predated the
-   * migration and had never changed stage still worked. It surfaced days later when someone tried to
-   * remove a duplicate contact. The migration added a table and a trigger without a full audit of what
-   * already read or wrote contacts.
+   * THIS WAS A LIVE OUTAGE, and one I caused. Migration 0020 (2026-08-18) added contact_stage_event
+   * plus a contact_stage_initial trigger that fires AFTER INSERT, so from that moment EVERY contact
+   * carries at least one stage-history row. contact_stage_event.contact_id is `NOT NULL REFERENCES
+   * contact(id)` with no ON DELETE CASCADE, and this delete path was never taught about the new
+   * table — so the DELETE below aborted on a foreign key violation and the route returned a 500.
+   * 4,454 of 4,592 contacts were undeletable; the only survivors were 138 records that predated the
+   * migration and had never changed stage. The owner hit it two days later trying to remove a duplicate
+   * contact. The migration added a table and a trigger and I never asked what already read or
+   * wrote contacts.
    *
    * Ordered with the other child cleanups above rather than relying on the database, because SQLite
-   * cannot add ON DELETE CASCADE to an existing constraint without rebuilding the table, and a rebuild
-   * of a large table with two triggers hanging off it is a much bigger risk than four lines here. THE
-   * TRAP GENERALISES: any future table referencing contact(id) needs a line here or it breaks deletion
-   * the same silent way. Stated in definitions.md.
+   * cannot add ON DELETE CASCADE to an existing constraint without rebuilding the table, and a
+   * rebuild of a 4,500-row table with two triggers hanging off it is a much bigger risk than four
+   * lines here. THE TRAP GENERALISES: any future table referencing contact(id) needs a line here or
+   * it breaks deletion the same silent way. Stated in definitions.md.
    *
    * Audited as a single count rather than one event per row, unlike the action items above. Those are
    * human commitments and each one deserves naming; these are machine-generated movement records, and
@@ -636,7 +644,7 @@ app.post("/contacts/:id/delete", async (c) => {
        )`
     )
       .bind(
-        ACTOR,
+        actor(),
         "contact_stage_event",
         String(id),
         "delete",
@@ -645,6 +653,61 @@ app.post("/contacts/:id/delete", async (c) => {
         `delete-contact-${id}`,
         `delete-contact-${id}`,
         String(id)
+      )
+      .run();
+  }
+
+  /*
+   * commitment (0035): a sales commitment names a person as context, not as its owner, so deleting the
+   * contact UNLINKS it — the commitment and its outcome are the owner's record and are kept, like the
+   * hours on time_entry above. Audited as a count, correlated with the contact deletion.
+   */
+  const commitmentLinks = await c.env.DB.prepare("SELECT COUNT(*) AS n FROM commitment WHERE contact_id = ?")
+    .bind(id)
+    .first<{ n: number }>();
+  if ((commitmentLinks?.n ?? 0) > 0) {
+    await c.env.DB.prepare("UPDATE commitment SET contact_id = NULL, updated_at = datetime('now') WHERE contact_id = ?")
+      .bind(id)
+      .run();
+    await c.env.DB.prepare(
+      "INSERT INTO audit_event (actor, entity, entity_id, action, before_summary, after_summary, source, correlation_id) VALUES (?,'commitment',?,'update',?,?,'app',?)"
+    )
+      .bind(
+        actor(),
+        String(id),
+        `${commitmentLinks?.n ?? 0} sales commitment${(commitmentLinks?.n ?? 0) === 1 ? "" : "s"} linked to this contact`,
+        `contact link cleared, commitments KEPT — only the link to ${contact.full_name} is gone`,
+        `delete-contact-${id}`
+      )
+      .run();
+  }
+
+  /*
+   * outreach_item (0032, Phase 2a): the third recurrence of the trap above, caught by the /health check
+   * the day it shipped. Queue entries and drafts for a contact being deleted are derived working data,
+   * so they go with the contact, counted in one audit line like the stage events. Any follow-up that
+   * points at one of them (parent_item_id) is cleared first so the self-reference can't block the
+   * delete. An Outlook draft already saved to the mailbox is left there; the app never deletes mail.
+   */
+  const outreach = await c.env.DB.prepare("SELECT COUNT(*) AS n FROM outreach_item WHERE contact_id = ?")
+    .bind(id)
+    .first<{ n: number }>();
+  if ((outreach?.n ?? 0) > 0) {
+    await c.env.DB.prepare(
+      "UPDATE outreach_item SET parent_item_id = NULL WHERE parent_item_id IN (SELECT id FROM outreach_item WHERE contact_id = ?)"
+    )
+      .bind(id)
+      .run();
+    await c.env.DB.prepare("DELETE FROM outreach_item WHERE contact_id = ?").bind(id).run();
+    await c.env.DB.prepare(
+      "INSERT INTO audit_event (actor, entity, entity_id, action, before_summary, after_summary, source, correlation_id) VALUES (?,'outreach',?,'delete',?,?,'app',?)"
+    )
+      .bind(
+        actor(),
+        String(id),
+        `${outreach?.n ?? 0} outreach queue/draft record${(outreach?.n ?? 0) === 1 ? "" : "s"}`,
+        `removed with contact ${contact.full_name}`,
+        `delete-contact-${id}`
       )
       .run();
   }
@@ -681,7 +744,7 @@ app.post("/contacts/:id/delete", async (c) => {
          )`
       )
         .bind(
-          ACTOR,
+          actor(),
           "organization",
           String(contact.organization_id),
           "delete",

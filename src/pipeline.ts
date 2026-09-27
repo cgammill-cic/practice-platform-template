@@ -13,12 +13,12 @@
  *
  * THREE THINGS THE DATA CANNOT TELL YOU, all stated on the page:
  *
- *   1. NOTHING EXISTS BEFORE THIS TABLE STARTED RECORDING. Not "was quiet" — did not get recorded. Any
- *      month before that reads as zero and it means nothing.
- *   2. CONTACTS BROUGHT IN BY A BULK IMPORT HAVE NO ARRIVAL ROW. Migration 0020 deliberately refused to
- *      invent one: their stage came from a spreadsheet code and `created_at` is when the row was
- *      written, not when the relationship reached that stage. So "entered the pipeline" undercounts,
- *      permanently, and a contact appears here only once it genuinely moves.
+ *   1. NOTHING EXISTS BEFORE 2026-07-30. Not "was quiet" — did not get recorded. Any month before that
+ *      reads as zero and it means nothing.
+ *   2. THE 295 IMPORTED CONTACTS HAVE NO ARRIVAL ROW. Migration 0020 deliberately refused to invent one:
+ *      their stage came from a spreadsheet code and `created_at` is when the row was written, not when
+ *      the relationship reached that stage. So "entered the pipeline" undercounts, permanently, and a
+ *      contact appears here only once it genuinely moves.
  *   3. AN OPEN SPELL IS NOT A SHORT SPELL. Dwell time is computed only between two consecutive events,
  *      so a contact still sitting in a stage contributes nothing. Averaging what has already resolved
  *      biases every figure DOWNWARD — the slow ones are exactly the ones still open. Counts travel
@@ -77,20 +77,20 @@ async function provenance(db: D1Db): Promise<Provenance> {
 }
 
 /*
- * ORIGINS THAT ARE NOT MOVEMENT.
+ * ORIGINS THAT ARE NOT MOVEMENT (2026-08-21).
  *
  * A stage event records that the stage changed. It does not follow that a RELATIONSHIP moved, and this
  * page only ever meant the second thing. Two origins are reclassification rather than movement:
  *
- *   'import-corrected'  stages repaired after an importer had misread priority codes as stages. Those
- *                       contacts were never in conversation; the record was wrong and got fixed.
- *   'bulk-update'       a sweep applied from a file (REL-033). When an operator marks a batch of people
- *                       Retired from a spreadsheet, nothing actually happened between them and those
- *                       people.
+ *   'import-corrected'  the 1,105 stages repaired on 2026-08-20 after the importer had read priority
+ *                       codes as stages. Those contacts were never in conversation; the record was
+ *                       wrong and got fixed.
+ *   'bulk-update'       a sweep applied from a file (REL-033). When the owner marks 400 people Retired
+ *                       from a spreadsheet, nothing happened between him and those people.
  *
  * Both are kept in the history — the record genuinely changed and the trail must say so — and both are
- * excluded here. Counting them would put a wall of arrivals into Retired in one second on a page whose
- * whole job is showing where relationships are going, burying every real signal underneath a data fix.
+ * excluded here. Counting them would put 400 arrivals into Retired in one second on a page whose whole
+ * job is showing where relationships are going, burying every real signal underneath a data fix.
  *
  * The first time this came up it was cleaned up after the fact, by rewriting rows. Naming the rule here
  * means the next bulk correction does not need that.
@@ -262,11 +262,15 @@ app.get("/pipeline", async (c) => {
     .join("");
 
   return c.html(
-    layout({
+    layout({ c,
       title: "Pipeline Movement",
       body: `<main>
   <h1>Pipeline Movement</h1>
-  <p class="sub">What moved between stages, where it came from, and how long it sat · <a href="/">dashboard</a> · <a href="/time/report">weekly hours</a></p>
+  <p class="meta" style="margin:0 0 4px">What moved between stages, where it came from, and how long it sat</p>
+  <div class="linkbar">
+    <a class="linkchip" href="/">Dashboard</a>
+    <a class="linkchip" href="/time/report">Weekly Hours</a>
+  </div>
 
   ${/* The provenance band. Not decoration — it is what makes every number below safe to read. */ ""}
   <div class="card" style="border-left:3px solid var(--line)">
@@ -276,10 +280,10 @@ app.get("/pipeline", async (c) => {
     is <b>not guaranteed complete</b>; <b>${prov.live}</b> have been captured as they happened, from
     <b>${esc(prov.liveFrom ?? "—")}</b> onward. <b>Nothing exists before ${esc(prov.first ?? "—")}</b> — an
     earlier period reads as zero because nothing was recorded, not because nothing happened.</p>
-    <p class="meta" style="margin:8px 0 0">The contacts loaded by the original import carry <b>no arrival
-    row</b>, deliberately: their stage came from a spreadsheet code, and inventing a movement for each of
-    them dated to import day would put a spike in every chart here that never happened. A contact appears
-    below only once it genuinely moves, so "entered the pipeline" undercounts and always will.</p>
+    <p class="meta" style="margin:8px 0 0">The 295 contacts loaded by the original import carry <b>no arrival
+    row</b>, deliberately: their stage came from a spreadsheet code, and inventing 295 movements dated to
+    import day would put a spike in every chart here that never happened. A contact appears below only once
+    it genuinely moves, so "entered the pipeline" undercounts and always will.</p>
   </div>
 
   <div class="actions" style="margin:14px 0">${nav}</div>

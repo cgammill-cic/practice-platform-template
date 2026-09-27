@@ -1,20 +1,20 @@
 -- 0013 — Title Case the multi-word activity categories.
 --
--- "Let's make 'Business development' 'Business Development'. I like to capitalize both letters in
--- this type of deal." (2026-08-11)
+-- The owner, 2026-08-11: "Let's make 'Business development' 'Business Development'. I like to capitalize
+-- both letters in this type of deal."
 --
--- WHY THIS CAME UP, because the sequence matters. The Outlook calendar was read on 2026-08-11 through a
+-- WHY THIS CAME UP, because the sequence matters. His Outlook calendar was read on 2026-08-11 through a
 -- Microsoft connector (not through the app — there is no calendar connection yet, see M365-001). Eleven
 -- events in the week of 9 August carried the category `Business Development` with a capital D. The
 -- standard agreed on 2026-07-29 and written into definitions.md §5a spells it `Business development`.
 --
--- So the largest category in that actual week would have been REJECTED by the CHECK constraint added in
+-- So the largest category in his actual week would have been REJECTED by the CHECK constraint added in
 -- 0012 — which is the constraint doing precisely the job it was added for, three days early and before a
 -- single row existed. The alternative design, no constraint, would have accepted both spellings and split
 -- every report between them with nothing looking wrong.
 --
 -- Resolved in favour of the calendar rather than the document: Outlook is where the categorising actually
--- happens, and the operator has a stated preference. Four values change; the other six are single words or
+-- happens, and the owner has a stated preference. Four values change; the other six are single words or
 -- already capitalised on both sides of the slash.
 --
 --   Business development     → Business Development

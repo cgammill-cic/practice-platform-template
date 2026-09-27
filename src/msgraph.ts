@@ -3,15 +3,15 @@
  *
  * This module is ONLY the connection: sign in, hold a refresh token safely, hand out an access token when
  * something needs one, and say plainly whether it is working. The calendar import that consumes it is a
- * separate piece of work, deliberately — the sign-in round trip is the one part of this that only the
- * operator can verify, so it needs to work end to end before anything is built on top of it.
+ * separate piece of work, deliberately — the sign-in round trip is the one part of this that only the owner
+ * can verify, so it reaches him before anything is built on top of it.
  *
  * DELEGATED, READ-ONLY, ONE USER
  * ------------------------------
  * The authorization code flow with a confidential client, requesting `Calendars.Read` — the app acts as
- * the connected operator and can see exactly what they can see. The alternative, app-only client
- * credentials, would have granted access to every mailbox in the tenant by default, narrowable afterwards
- * with a policy. Least privilege was cheaper here than the cleanup.
+ * The owner and can see exactly what he can see. The alternative, app-only client credentials, would have
+ * granted access to every mailbox in the tenant by default, narrowable afterwards with a policy. Least
+ * privilege was cheaper here than the cleanup.
  *
  * PKCE IS INCLUDED even though a confidential client does not require it. It costs a hash and it removes a
  * whole class of failure — an authorization code intercepted in transit is useless without the verifier,
@@ -28,26 +28,27 @@
  * round trip on a weekly import. The refresh token is exchanged for a fresh access token on demand.
  */
 
-import { Hono } from "hono";
+import { Hono, type Context } from "hono";
 import { getCookie, setCookie, deleteCookie } from "hono/cookie";
 import { esc, layout } from "./views";
 import type { Bindings, D1Db } from "./types";
+import { actor } from "./auth";
 
 const app = new Hono<{ Bindings: Bindings }>();
 
 /** Scopes requested. Read-only on the calendar; nothing here ever writes to Outlook. */
 /*
- * Mail.ReadBasic added (MAIL-001) and the choice is deliberate: it carries sender,
+ * Mail.ReadBasic added 2026-09-01 (MAIL-001) and the choice is deliberate: it carries sender,
  * recipients, subject and date — everything an interaction record needs — while excluding message
- * BODIES. The app therefore cannot read what the operator wrote to a client or what they wrote back,
- * which is the right default for a tool whose value to those clients rests on discretion. Widening to
+ * BODIES. The app therefore cannot read what the owner wrote to a client or what they wrote back, which
+ * is the right default for a tool whose value to those clients rests on discretion. Widening to
  * Mail.Read is one word here plus a re-consent, if bodies are ever wanted in notes.
  *
  * CHANGING THIS STRING BREAKS THE WHOLE CONNECTION UNTIL SOMEONE SIGNS IN AGAIN. Not just the new
  * capability — everything, calendar included.
  *
  * This paragraph previously predicted the opposite: "an existing connection keeps working with the OLD
- * set and mail calls 403". That was wrong, and it was wrong in production. The refresh in
+ * set and mail calls 403". That was wrong, and it was wrong in production on 2026-09-01. The refresh in
  * msAccessToken sends THIS string, so every refresh after the change asks Microsoft for a permission the
  * stored grant does not carry, and the answer is `invalid_grant` — a dead connection, not a narrower one.
  * The calendar import went down with it.
@@ -66,7 +67,49 @@ const app = new Hono<{ Bindings: Bindings }>();
  * outbound mail that AUTH-002 scoped a whole vendor integration for is one added scope on a connection
  * that already exists.
  */
-export const MS_SCOPES = "offline_access User.Read Calendars.Read Mail.ReadBasic Mail.Send";
+/*
+ * 2026-09-21 (MAIL-003, the owner) — WIDENED TO Mail.Read. The paragraph above was the right call until he
+ * asked for the opposite: a logged email's plain-text content copied into the interaction's Summary box,
+ * so he is not retyping what a message said every time he imports one. That needs the body, which
+ * ReadBasic does not carry, so the scope grew. The body is still fetched only for messages he actually
+ * ticks to log — see fetchMessageBody() in mailimport.ts — never for the whole week's preview, and only
+ * when the mail_body_to_summary setting (src/settings.ts) is on; he asked for an off switch in the same
+ * breath he asked for this, in case a future user of this app finds it more than they want pulled in.
+ *
+ * CHANGING THIS STRING BREAKS THE WHOLE CONNECTION UNTIL SOMEONE SIGNS IN AGAIN — same consequence as the
+ * 2026-09-01 change documented above, and the same fix: reconnect once from /health.
+ */
+/*
+ * 2026-09-25 (outreach drafting, Phase 2a) — Mail.ReadWrite added, so an outreach draft can be saved
+ * into the Drafts folder (POST /me/messages). It creates DRAFTS only; nothing here sends them, and
+ * Mail.Send stays confined to the digest-to-self path described above.
+ *
+ * AND THE WARNING ABOVE NO LONGER HOLDS. A refresh now asks only for the scopes the stored grant
+ * actually carries (refreshScopes below), so adding a scope here no longer kills the connection: the
+ * calendar sync, email import and digest keep working on the old grant, and only the new capability
+ * waits for a reconnect (hasScope, reported on /outreach and /health).
+ */
+export const MS_SCOPES = "offline_access User.Read Calendars.Read Mail.Read Mail.ReadWrite Mail.Send";
+
+/** Does a granted scope string (as Microsoft returned it) include `scope`? Bare or URL-prefixed. */
+export function grantHas(granted: string | null | undefined, scope: string): boolean {
+  const want = scope.toLowerCase();
+  return (granted ?? "")
+    .toLowerCase()
+    .split(/\s+/)
+    .some((s) => s === want || s.endsWith(`/${want}`));
+}
+
+/**
+ * The scopes to send on a refresh: the ones requested that the grant already has, plus offline_access.
+ * An unknown grant (a row saved before scopes were recorded) falls back to everything, the old behaviour.
+ */
+export function refreshScopes(granted: string | null | undefined): string {
+  if (!granted) return MS_SCOPES;
+  return MS_SCOPES.split(" ")
+    .filter((s) => s === "offline_access" || grantHas(granted, s))
+    .join(" ");
+}
 
 /** Short-lived cookie carrying the PKCE verifier and the CSRF nonce between redirect and callback. */
 const FLOW_COOKIE = "pp_ms_flow";
@@ -74,8 +117,8 @@ const FLOW_TTL_SECONDS = 600;
 
 /**
  * Where Microsoft's endpoints live. Overridable ONLY so the token exchange can be driven against a local
- * stub in tests — the real OAuth round trip cannot be completed from the build environment (no signed-in
- * browser session, no outbound network to Microsoft), so a stub is the only way to test the exchange,
+ * stub in tests — the real OAuth round trip cannot be completed from the build environment (no browser
+ * session as the owner, no outbound network to Microsoft), so a stub is the only way to test the exchange,
  * the refresh path and an expired-grant failure at all. Unset in production, where it defaults below.
  * Anyone who can set this variable can already replace the whole Worker, so it adds no attack surface.
  */
@@ -216,8 +259,8 @@ export async function msAccessToken(
 ): Promise<{ token: string } | { error: string }> {
   if (!msConfigured(env)) return { error: "Microsoft credentials are not configured on this deployment." };
   const row = await db
-    .prepare("SELECT refresh_token_enc FROM ms_connection WHERE id = 1")
-    .first<{ refresh_token_enc: string }>();
+    .prepare("SELECT refresh_token_enc, scope FROM ms_connection WHERE id = 1")
+    .first<{ refresh_token_enc: string; scope: string | null }>();
   if (!row) return { error: "Outlook is not connected yet." };
 
   const refresh = await decryptToken(env.SESSION_SECRET, row.refresh_token_enc);
@@ -233,7 +276,7 @@ export async function msAccessToken(
     client_id: env.MS_CLIENT_ID!,
     client_secret: env.MS_CLIENT_SECRET!,
     refresh_token: refresh,
-    scope: MS_SCOPES,
+    scope: refreshScopes(row.scope),
   });
 
   if (res.error || !res.access_token) {
@@ -405,9 +448,9 @@ app.get("/auth/microsoft/callback", async (c) => {
 
   // The audit event records the connection, the account and the scopes — never the token.
   await c.env.DB.prepare(
-    "INSERT INTO audit_event (actor, entity, entity_id, action, after_summary, source) VALUES ('operator','ms_connection','1','create',?, 'app')"
+    "INSERT INTO audit_event (actor, entity, entity_id, action, after_summary, source) VALUES (?,'ms_connection','1','create',?, 'app')"
   )
-    .bind(`connected Outlook as ${upn} · scopes: ${res.scope ?? MS_SCOPES}`)
+    .bind(actor(), `connected Outlook as ${upn} · scopes: ${res.scope ?? MS_SCOPES}`)
     .run();
 
   return c.redirect("/health?msflash=connected");
@@ -418,9 +461,9 @@ app.post("/auth/microsoft/disconnect", async (c) => {
   if (!existing) return c.redirect("/health");
   await c.env.DB.prepare("DELETE FROM ms_connection WHERE id = 1").run();
   await c.env.DB.prepare(
-    "INSERT INTO audit_event (actor, entity, entity_id, action, before_summary, source) VALUES ('operator','ms_connection','1','delete',?,'app')"
+    "INSERT INTO audit_event (actor, entity, entity_id, action, before_summary, source) VALUES (?,'ms_connection','1','delete',?,'app')"
   )
-    .bind(`disconnected Outlook (was ${existing.account_upn})`)
+    .bind(actor(), `disconnected Outlook (was ${existing.account_upn})`)
     .run();
   /*
    * The token is deleted here but NOT revoked at Microsoft — Graph has no simple revoke-this-token call, and
@@ -485,7 +528,7 @@ export function msPanel(env: Bindings, conn: MsConnection | null, flash: string,
     <h2>Outlook Calendar <span class="pill amber" style="margin-left:6px">Not connected</span></h2>
     ${flashHtml}
     <p style="margin:0 0 6px">Configured but not connected. Signing in once lets the app read your calendar for the weekly time import; it never writes to it.</p>
-    <p class="meta" style="margin:0 0 12px">Read-only access to your calendar and your own profile. You stay signed in until you disconnect here, change your password, or sign out everywhere.</p>
+    <p class="meta" style="margin:0 0 12px">Read-only access to your calendar, your email, and your own profile. You stay signed in until you disconnect here, change your password, or sign out everywhere.</p>
     <div class="actions"><a class="btn" href="/auth/microsoft">Connect Outlook</a></div>
   </section>`;
 
@@ -506,9 +549,15 @@ export function msPanel(env: Bindings, conn: MsConnection | null, flash: string,
         ? `<p class="flash warn" style="margin-top:10px">${esc(conn.last_error)}</p>`
         : ""
     }
+    ${
+      // Outreach drafting (Phase 2a): the one capability that waits on a reconnect. Everything else works.
+      !canSaveDrafts(conn)
+        ? `<p class="flash warn" style="margin-top:10px">Outreach email drafts can't be saved to Outlook yet: this sign-in predates that permission. Use <b>Reconnect</b> below once; the calendar sync and email import keep working either way.</p>`
+        : ""
+    }
     ${/*
-      RECONNECT IS OFFERED WHENEVER A CONNECTION EXISTS (MAIL-002). It is here because its
-      absence was a dead end that an operator walked straight into on an earlier deployment.
+      RECONNECT IS OFFERED WHENEVER A CONNECTION EXISTS (MAIL-002, 2026-09-01). It is here because its
+      absence was a dead end I built and the owner walked straight into.
 
       Adding Mail.ReadBasic to MS_SCOPES broke the refresh outright. The refresh request sends the CURRENT
       scope string, Microsoft will not issue a token covering a scope the user never consented to, and the
@@ -538,6 +587,112 @@ export function msPanel(env: Bindings, conn: MsConnection | null, flash: string,
 }
 
 /** Layout wrapper for the rare case something needs its own page. Kept minimal; the panel lives on /health. */
-export const msPage = (body: string) => layout({ title: "Outlook Calendar", body: `<main>${body}</main>` });
+// No caller today (verified: no route in src/ mounts a page through this) — kept compiling here so a
+// future caller has it ready, and flagged separately as dead-code worth removing if it stays unused.
+export const msPage = (c: Context<{ Bindings: Bindings }>, body: string) =>
+  layout({ title: "Outlook Calendar", body: `<main>${body}</main>`, c });
+
+/*
+ * Sending to account holders (Phase 3c, 2026-09-25). Mail.Send was confined to "the digest, to the
+ * connected account only" (see MS_SCOPES above). It now also carries invites and password-reset links,
+ * and it is still narrow on purpose: sendMailAsOwner refuses any address that isn't an account on this
+ * copy (app_user), so no contact, and no address a stranger types, can ever be emailed by the app.
+ */
+export const canSendMail = (conn: MsConnection | null) => !!conn && grantHas(conn.scope, "Mail.Send");
+
+export async function sendMailAsOwner(
+  env: Bindings,
+  db: D1Db,
+  msg: { to: string; subject: string; text: string }
+): Promise<{ ok: true } | { error: string }> {
+  const account = await db
+    .prepare("SELECT 1 AS x FROM app_user WHERE email = ? COLLATE NOCASE")
+    .bind(msg.to.trim())
+    .first()
+    .catch(() => null);
+  if (!account) return { error: "That address isn't an account on this copy, so the app won't email it." };
+  const conn = await msConnection(db);
+  if (!canSendMail(conn)) return { error: "Outlook isn't connected with permission to send, so nothing was emailed." };
+  const tok = await msAccessToken(env, db);
+  if ("error" in tok) return tok;
+  const res = await fetch(`${graphBase(env)}/me/sendMail`, {
+    method: "POST",
+    headers: { authorization: `Bearer ${tok.token}`, "content-type": "application/json" },
+    body: JSON.stringify({
+      message: {
+        subject: msg.subject,
+        body: { contentType: "Text", content: msg.text },
+        toRecipients: [{ emailAddress: { address: msg.to.trim() } }],
+      },
+      saveToSentItems: true,
+    }),
+  });
+  if (!res.ok) return { error: `Outlook refused to send (${res.status}).${res.status === 403 ? " Reconnect Outlook on Health." : ""}` };
+  return { ok: true };
+}
+
+/** Can this connection save Outlook drafts (Mail.ReadWrite granted)? */
+export const canSaveDrafts = (conn: MsConnection | null) => !!conn && grantHas(conn.scope, "Mail.ReadWrite");
+
+/**
+ * Save an outreach draft into the connected mailbox's Drafts folder (Phase 2a). DRAFT ONLY: this is
+ * POST /me/messages, which creates an unsent message; it never calls /send. Plain text body, one
+ * recipient. Returns the draft's id and the Outlook web link that opens it for review.
+ */
+export async function createOutlookDraft(
+  env: Bindings,
+  db: D1Db,
+  msg: { to: string; subject: string; body: string }
+): Promise<{ id: string; webLink: string | null } | { error: string }> {
+  const conn = await msConnection(db);
+  if (!canSaveDrafts(conn)) return { error: "Reconnect Outlook on Health to allow saving drafts." };
+  const tok = await msAccessToken(env, db);
+  if ("error" in tok) return tok;
+  const res = await fetch(`${graphBase(env)}/me/messages`, {
+    method: "POST",
+    headers: { authorization: `Bearer ${tok.token}`, "content-type": "application/json" },
+    body: JSON.stringify({
+      subject: msg.subject,
+      body: { contentType: "Text", content: msg.body },
+      toRecipients: [{ emailAddress: { address: msg.to } }],
+    }),
+  });
+  if (!res.ok) {
+    const hint = res.status === 403 ? " Reconnect Outlook on Health to grant draft access." : "";
+    return { error: `Outlook refused the draft (${res.status}).${hint}` };
+  }
+  const j = (await res.json()) as { id?: string; webLink?: string };
+  return j.id ? { id: j.id, webLink: j.webLink ?? null } : { error: "Outlook did not return a draft id." };
+}
+
+/**
+ * Update an outreach draft already in Outlook (after an edit or a redraft), so there is one draft per
+ * person rather than a pile. PATCH on a draft only; a message that has since been sent can't be
+ * changed, and Graph says so, which comes back as an error on the item.
+ */
+export async function updateOutlookDraft(
+  env: Bindings,
+  db: D1Db,
+  id: string,
+  msg: { to: string; subject: string; body: string }
+): Promise<{ id: string; webLink: string | null } | { error: string }> {
+  const conn = await msConnection(db);
+  if (!canSaveDrafts(conn)) return { error: "Reconnect Outlook on Health to allow saving drafts." };
+  const tok = await msAccessToken(env, db);
+  if ("error" in tok) return tok;
+  const res = await fetch(`${graphBase(env)}/me/messages/${encodeURIComponent(id)}`, {
+    method: "PATCH",
+    headers: { authorization: `Bearer ${tok.token}`, "content-type": "application/json" },
+    body: JSON.stringify({
+      subject: msg.subject,
+      body: { contentType: "Text", content: msg.body },
+      toRecipients: [{ emailAddress: { address: msg.to } }],
+    }),
+  });
+  if (res.status === 404) return createOutlookDraft(env, db, msg); // deleted in Outlook: make a fresh one
+  if (!res.ok) return { error: `Outlook didn't accept the change (${res.status}). If it was already sent, log it as sent.` };
+  const j = (await res.json()) as { id?: string; webLink?: string };
+  return { id: j.id ?? id, webLink: j.webLink ?? null };
+}
 
 export default app;

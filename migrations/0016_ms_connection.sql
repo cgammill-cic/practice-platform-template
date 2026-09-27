@@ -1,6 +1,6 @@
 -- 0016 — the Microsoft Graph connection (M365-001, issue #99).
 --
--- Holds ONE thing: the long-lived refresh token that lets the app read the operator's calendar without
+-- Holds ONE thing: the long-lived refresh token that lets the app read the owner's calendar without him
 -- signing in again, plus enough context to say on /health whether the connection is alive and whose it is.
 --
 -- WHY A TABLE AND NOT A SECRET
@@ -28,7 +28,7 @@
 --
 -- account_upn is stored so /health can name whose calendar is connected, and so a DIFFERENT account
 -- signing in can be refused rather than silently replacing the first. Reading someone else's calendar into
--- the operator's time sheet by accident is exactly the class of quiet error this codebase keeps refusing.
+-- The owner's time sheet by accident is exactly the class of quiet error this codebase keeps refusing.
 --
 -- last_error holds the reason the most recent refresh failed, or NULL. A connection that has stopped
 -- working must say so on /health rather than presenting an import that silently returns no events — the

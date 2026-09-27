@@ -1,4 +1,16 @@
-import { TERMINAL_STAGES } from "./types";
+import type { Context } from "hono";
+import { getCookie } from "hono/cookie";
+import { TERMINAL_STAGES, type Bindings } from "./types";
+import { adminOnlyPath, isAdmin, whoami } from "./auth";
+import { appSettings } from "./settings";
+import { pendingCountCached } from "./migrate";
+
+/** Cache-busting suffixes for the brand images: change when a new one is uploaded on Settings. */
+export const logoV = () => (appSettings().logo ? `?v=${encodeURIComponent(appSettings().logo!)}` : "");
+export const iconV = () => {
+  const v = appSettings().icon ?? appSettings().logo;
+  return v ? `?v=${encodeURIComponent(v)}` : "";
+};
 // HTML rendering helpers. Server-rendered, no client framework — fast and simple for a single user.
 
 export function esc(value: unknown): string {
@@ -11,50 +23,187 @@ export function esc(value: unknown): string {
     .replace(/'/g, "&#39;");
 }
 
+/*
+ * Theme tokens ("Command Console", 2026-09-14). Two full palettes rather than one — dark is the
+ * default for every first visit, light is one click away, and neither is derived from the other by
+ * filters or opacity tricks. Every color a component needs has a name here; a component should never
+ * reach for a literal hex value, because that is exactly the thing that would silently ignore a theme
+ * switch.
+ *
+ * `prefers-color-scheme` is deliberately NOT consulted. This is a choice, not an oversight: once the
+ * cookie exists it is the only source of truth, and a media query fighting an explicit click is a real
+ * bug class (flash-of-wrong-theme on a browser whose OS setting disagrees with what was chosen last
+ * time). Dark renders on a first visit regardless of OS setting.
+ */
 const STYLE = `
-  :root { --ink:#1a2332; --accent:#2563eb; --line:#e2e8f0; --muted:#64748b; --bg:#f8fafc; }
+  :root {
+    --bg:#0e1116; --surface:#161a21; --surface-2:#1c212a; --ink:#e7e9ee; --muted:#8890a0; --faint:#838ba0;
+    --line:#262b35; --accent:#7c6fe8; --accent-tint:#221f3a; --amber:#e0a94a; --amber-tint:#332b19;
+    --red:#e2685f; --red-tint:#331d1c; --green:#5fbf8f; --green-tint:#122a20;
+  }
+  /* Same specificity as :root (both target <html>), so source order decides — this block must stay
+     second, and nothing later should add a third override that could silently win by accident. */
+  html[data-theme="light"] {
+    --bg:#f4f5f8; --surface:#ffffff; --surface-2:#eceef2; --ink:#14171d; --muted:#5b6272; --faint:#666d7d;
+    --line:#dde1e8; --accent:#6a5cd6; --accent-tint:#efedfd; --amber:#a8720d; --amber-tint:#fbf0da;
+    --red:#b23b34; --red-tint:#fbeae8; --green:#2f7d5e; --green-tint:#e8f5ee;
+  }
   * { box-sizing:border-box; }
-  body { font:16px/1.5 system-ui,-apple-system,"Segoe UI",sans-serif; color:var(--ink); margin:0; background:var(--bg); }
+  body { font:16px/1.5 "Sora",system-ui,-apple-system,"Segoe UI",sans-serif; color:var(--ink); margin:0; background:var(--bg); }
   a { color:var(--accent); text-decoration:none; }
   a:hover { text-decoration:underline; }
-  header { background:#fff; border-bottom:1px solid var(--line); padding:12px 24px; display:flex; justify-content:space-between; align-items:center; gap:16px; flex-wrap:wrap; }
-  header nav { display:flex; gap:16px; font-size:14px; align-items:center; flex-wrap:wrap; }
+  /* Seeded now for later phases to apply to specific date/number spans in prose or pills. Scope in
+     this pass stays narrow — see .num and .hist-date below — rather than monospacing every td. */
+  .mono { font-family:"JetBrains Mono",ui-monospace,"SFMono-Regular","Courier New",monospace; }
+
+  /* ------------------------------------------------------------------ shell: rail + content
+     Replaces the flat 18-link <header nav> (2026-09-14). That list had grown one link at a time since
+     #56 and had no grouping, no icons, and no sense of where you were — a genuinely different problem
+     from "not enough color". Grouped by the actual shape of the work (Relationships, Pursuits, Time,
+     Data) rather than by when a link was added. */
+  .shell { display:flex; min-height:100vh; align-items:flex-start; }
+  /* Sticky, not just flex-stretched: a dashboard taller than one screen used to stretch the rail's own
+     box to match it, leaving blank space below the (much shorter) nav once you scrolled past it. Pinned
+     to the viewport instead, so the rail is where you left it regardless of how far main-area scrolls. */
+  .rail { width:228px; flex:none; position:sticky; top:0; height:100vh; background:var(--surface);
+    border-right:1px solid var(--line); display:flex; flex-direction:column; padding:16px 12px; }
+  .rail-brand { padding:4px 8px 18px; }
+  .rail-brand a { display:flex; align-items:center; gap:9px; color:inherit; }
+  .rail-brand a:hover { text-decoration:none; }
+  .rail-brand b { font-size:14px; line-height:1.25; }
+  .rail-nav { flex:1; overflow-y:auto; }
+  .rail-group { margin-bottom:14px; }
+  .rail-group-label { font-size:10.5px; font-weight:600; letter-spacing:.07em; text-transform:uppercase;
+    color:var(--faint); padding:0 10px 5px; }
+  .rail-link { display:flex; align-items:center; gap:10px; padding:8px 10px; border-radius:8px;
+    font-size:13.5px; font-weight:500; color:var(--muted); }
+  .rail-link svg { flex:none; opacity:.8; }
+  .rail-link:hover { background:var(--surface-2); color:var(--ink); text-decoration:none; }
+  .rail-link.active { background:var(--accent-tint); color:var(--accent); }
+  .rail-link.active svg { opacity:1; }
+  .rail-foot { border-top:1px solid var(--line); padding-top:10px; margin-top:6px; }
+  .rail-foot .rail-link { font-size:13px; }
+  /* Two links, not a JS toggle — clicking either is already a navigation (a full re-render is what a
+     theme switch needs anyway, and this way it needs zero client JS in an app that has almost none). */
+  .theme-toggle { display:flex; gap:4px; padding:2px; background:var(--surface-2); border:1px solid var(--line);
+    border-radius:8px; margin:4px 4px 10px; }
+  .theme-toggle a { flex:1; text-align:center; padding:6px 0; border-radius:6px; color:var(--faint);
+    font-size:12px; font-weight:600; }
+  .theme-toggle a:hover { text-decoration:none; }
+  .theme-toggle a.active { background:var(--surface); color:var(--ink); }
+
+  .main-area { flex:1; min-width:0; }
   main { max-width:900px; margin:24px auto 60px; padding:0 20px; }
   h1 { font-size:22px; margin:0 0 4px; }
   h2 { font-size:15px; margin:0 0 8px; color:var(--accent); }
   .sub { color:var(--muted); font-size:14px; margin:0 0 20px; }
-  section, .card { background:#fff; border:1px solid var(--line); border-radius:10px; padding:16px 18px; margin-bottom:14px; }
-  table { width:100%; border-collapse:collapse; background:#fff; border:1px solid var(--line); border-radius:10px; overflow:hidden; }
+  /* Chip-style link row (2026-09-14) — a page's utility links (browse all, export, clear filters...)
+     as small pill buttons instead of plain text separated by "·", matching the pill/dot vocabulary the
+     rest of the app already uses. .count is for a link carrying a number worth calling out (e.g. "8
+     missing LinkedIn") — same accent tint as an active nav item, so it reads as worth a look. */
+  .linkbar { display:flex; flex-wrap:wrap; gap:6px; margin:0 0 20px; }
+  .linkchip { display:inline-flex; align-items:center; gap:5px; padding:5px 12px; border-radius:99px;
+    background:var(--surface-2); border:1px solid var(--line); color:var(--muted); font-size:13px; }
+  .linkchip:hover { background:var(--accent-tint); color:var(--accent); border-color:var(--accent); text-decoration:none; }
+  .linkchip.count { background:var(--accent-tint); color:var(--accent); border-color:transparent; font-weight:600; }
+  section, .card { background:var(--surface); border:1px solid var(--line); border-radius:10px; padding:16px 18px; margin-bottom:14px; }
+  table { width:100%; border-collapse:collapse; background:var(--surface); border:1px solid var(--line); border-radius:10px; overflow:hidden; }
   th, td { text-align:left; padding:10px 12px; border-bottom:1px solid var(--line); font-size:14px; vertical-align:top; }
-  th { background:#f1f5f9; font-weight:600; font-size:13px; color:var(--muted); text-transform:uppercase; letter-spacing:.03em; }
+  th { background:var(--surface-2); font-weight:600; font-size:13px; color:var(--muted); text-transform:uppercase; letter-spacing:.03em; }
   tr:last-child td { border-bottom:0; }
-  .pill { display:inline-block; padding:2px 8px; border-radius:99px; font-size:12px; background:#eff6ff; color:#1e40af; white-space:nowrap; }
-  .pill.grey { background:#f1f5f9; color:var(--muted); }
-  .pill.red { background:#fef2f2; color:#b91c1c; }
-  .pill.amber { background:#fffbeb; color:#92400e; }
-  .pill.green { background:#f0fdf4; color:#166534; }
+  /* The colored dot is pure CSS on the existing .pill — every pill everywhere in the app picks this up
+     with no markup change, since followUpPill() and every call site keep emitting the exact same
+     classes and text they always did. Restyling here, not there, is the whole point of centralizing it. */
+  .pill { display:inline-flex; align-items:center; gap:5px; padding:2px 9px 2px 7px; border-radius:99px; font-size:12px; background:var(--surface-2); color:var(--muted); white-space:nowrap; }
+  .pill:before { content:"●"; font-size:8px; }
+  .pill.grey { background:var(--surface-2); color:var(--muted); }
+  .pill.red { background:var(--red-tint); color:var(--red); }
+  .pill.amber { background:var(--amber-tint); color:var(--amber); }
+  .pill.green { background:var(--green-tint); color:var(--green); }
+  /* Priority contact (migration 0029). The star replaces the status dot, because this pill is an
+     identity marker, not a status — a dot would read as one more follow-up signal. */
+  .pill.prio { background:var(--accent-tint); color:var(--accent); font-weight:600; }
+  .pill.prio:before { content:"★"; font-size:10px; }
+  /* ------------------------------------------------------------------ dashboard card-grid (Phase 2, 2026-09-14)
+     Replaces the eight dashboard sections' <table><tr><td> rows with one shared shape: a status dot, an
+     avatar-initials circle, a name/subtitle stack, and right-aligned metadata. The <details>/<summary>
+     collapse mechanism above (".dash") is untouched — only what renders inside each section changes. */
+  .stat-row { display:grid; grid-template-columns:repeat(auto-fit,minmax(130px,1fr)); gap:10px; margin:18px 0 22px; }
+  .stat { background:var(--surface); border:1px solid var(--line); border-radius:10px; padding:13px 15px; }
+  .stat-num { font-size:24px; font-weight:700; line-height:1.15; font-family:"JetBrains Mono",ui-monospace,monospace; }
+  .stat-label { color:var(--muted); font-size:12px; margin-top:3px; }
+
+  /* Section header: icon + title on the left (the title stays an <h2>, so it keeps the font-size/color/
+     margin already set on ".dash > summary h2" below), count badge pushed to the right. */
+  .card-h { display:flex; align-items:center; gap:8px; }
+  .card-h svg { flex:none; opacity:.85; }
+  .card-h .count { margin-left:auto; background:var(--accent-tint); color:var(--accent); font-size:11.5px;
+    font-weight:600; padding:2px 9px; border-radius:99px; font-family:"JetBrains Mono",ui-monospace,monospace; }
+
+  /* ".listrow", not ".row" above — that is an existing form-layout flex utility used across the contact,
+     engagement and organization forms, and reusing the name would collide with it. */
+  .list { border:1px solid var(--line); border-radius:10px; overflow:hidden; background:var(--surface); }
+  .listrow { display:flex; align-items:center; gap:10px; padding:10px 12px; border-bottom:1px solid var(--line);
+    flex-wrap:wrap; }
+  .listrow:last-child { border-bottom:0; }
+  .dot { width:8px; height:8px; border-radius:50%; flex:none; background:var(--muted); }
+  .dot.red { background:var(--red); }
+  .dot.amber { background:var(--amber); }
+  .dot.green { background:var(--green); }
+  .dot.accent { background:var(--accent); }
+  /* Stage column (Phase 3, 2026-09-14) — dot + plain text rather than a filled .pill, matching the
+     approved contacts-list mockup: a denser, lighter-weight treatment for a page that is a working
+     list of up to 300 rows rather than the dashboard's curated card-grid. */
+  .stagewrap { display:flex; align-items:center; gap:6px; }
+  .avatar { width:30px; height:30px; border-radius:50%; background:var(--surface-2); color:var(--muted);
+    display:flex; align-items:center; justify-content:center; font-size:11.5px; font-weight:700; flex:none;
+    font-family:"JetBrains Mono",ui-monospace,monospace; }
+  .listrow-main { flex:1 1 auto; min-width:0; }
+  .listrow-name { font-weight:600; }
+  .listrow-meta { flex:none; text-align:right; display:flex; flex-direction:column; align-items:flex-end; gap:4px; }
+
+  /* Contact record identity header (Phase 4, 2026-09-14) — a bordered bar in place of the bare <h1>,
+     matching the approved ContactRecord mockup. Reuses .avatar (sized up) and .stagewrap rather than
+     inventing a separate avatar shape or badge component. */
+  .avatar.lg { width:42px; height:42px; font-size:15px; }
+  .chead { display:flex; align-items:center; justify-content:space-between; gap:14px; flex-wrap:wrap;
+    background:var(--surface); border:1px solid var(--line); border-radius:10px; padding:14px 18px; margin-bottom:14px; }
+  .chead-id { display:flex; align-items:center; gap:12px; flex-wrap:wrap; }
+  .chead-name { font-size:17px; font-weight:700; }
+  .chead-sub { color:var(--muted); font-size:13px; }
+  .chead-acts { display:flex; gap:8px; flex:none; }
+
   label { display:block; font-size:13px; font-weight:600; margin:12px 0 4px; color:var(--ink); }
   label .hint { font-weight:400; color:var(--muted); }
   input[type=text], input[type=email], input[type=date], input[type=password], input[type=url], input[type=number], input[type=file], select, textarea {
-    width:100%; padding:9px 11px; border:1px solid var(--line); border-radius:8px; font-size:15px; font-family:inherit; background:#fff; }
+    width:100%; padding:9px 11px; border:1px solid var(--line); border-radius:8px; font-size:15px; font-family:inherit; background:var(--surface); color:var(--ink); }
+  /* The two field types that are always numeric/date content, never prose — narrow on purpose. */
+  input[type=date], input[type=number] { font-family:"JetBrains Mono",ui-monospace,monospace; }
   textarea { min-height:80px; resize:vertical; }
-  button, .btn { display:inline-block; padding:9px 16px; background:var(--accent); color:#fff; border:0; border-radius:8px; font-size:15px; cursor:pointer; text-decoration:none; }
-  button.secondary, .btn.secondary { background:#fff; color:var(--ink); border:1px solid var(--line); }
-  button.danger { background:#b91c1c; }
+  /* Show/Hide on every password field (2026-09-25, the owner's request). Added by the small script at the
+     end of layout(), so a new password field anywhere gets it without remembering to. */
+  .pw-wrap { position:relative; }
+  .pw-wrap input { padding-right:64px; }
+  .pw-wrap .pw-toggle { position:absolute; right:4px; top:50%; transform:translateY(-50%); min-height:0;
+    padding:5px 10px; font-size:13px; background:transparent; color:var(--muted); border:0; border-radius:6px; }
+  .pw-wrap .pw-toggle:hover, .pw-wrap .pw-toggle:focus-visible { color:var(--ink); background:var(--surface-2); }
+  button, .btn { display:inline-block; padding:9px 16px; background:var(--accent); color:#fff; border:0; border-radius:8px; font-size:15px; cursor:pointer; text-decoration:none; font-family:inherit; }
+  button.secondary, .btn.secondary { background:var(--surface); color:var(--ink); border:1px solid var(--line); }
+  button.danger { background:var(--red); }
   .row { display:flex; gap:12px; flex-wrap:wrap; }
   .row > * { flex:1 1 220px; }
   .actions { margin-top:20px; display:flex; gap:10px; align-items:center; flex-wrap:wrap; }
   .actions form { margin:0; }
   .banner { padding:10px 24px; font-size:14px; }
-  .banner.warn { background:#fef2f2; color:#b91c1c; border-bottom:1px solid #fecaca; }
-  .banner.info { background:#eff6ff; color:#1e40af; border-bottom:1px solid #bfdbfe; }
+  .banner.warn { background:var(--red-tint); color:var(--red); border-bottom:1px solid var(--line); }
+  .banner.info { background:var(--accent-tint); color:var(--accent); border-bottom:1px solid var(--line); }
   .empty { color:var(--muted); font-size:14px; padding:18px; text-align:center; }
   .searchbar { display:flex; gap:8px; margin-bottom:16px; }
   .searchbar input { flex:1; }
   .meta { color:var(--muted); font-size:13px; }
   .flash { padding:10px 14px; border-radius:8px; margin-bottom:14px; font-size:14px; }
-  .flash.ok { background:#f0fdf4; color:#166534; border:1px solid #bbf7d0; }
-  .flash.warn { background:#fffbeb; color:#92400e; border:1px solid #fde68a; }
+  .flash.ok { background:var(--green-tint); color:var(--green); border:1px solid var(--line); }
+  .flash.warn { background:var(--amber-tint); color:var(--amber); border:1px solid var(--line); }
   .grid2 { display:grid; grid-template-columns:150px 1fr; gap:6px 14px; font-size:14px; }
   .grid2 dt { color:var(--muted); }
   /* A long work email in a narrow value column is the one string here with no break opportunity in it,
@@ -93,48 +242,48 @@ const STYLE = `
      having. */
   button.tiny { padding:5px 10px; font-size:13px; }
 
-  /* ------------------------------------------------------------------ phone (UX-001, #56)
-     "I want to ensure that at some point, I can use this app on my iPhone." (2026-07-31)
-     It already worked — server-rendered HTML with a viewport tag — so this is about it being
-     pleasant. Optimised for the three things that actually happen on a phone: glance at today's
-     meetings on the way to one, tick an action item done, and log a note in the car afterwards.
-
-     TABLES BECOME CARDS. Seven columns cannot survive a 390px screen; they either overflow or
-     squeeze every cell to two words. Each row becomes a bordered card and each cell a labelled
-     line, which is the same information in the shape a phone can show.
-
-     The label comes from a data-label attribute on the cell, so a table opts in by carrying them.
-     (No backticks in this comment on purpose — the whole stylesheet is a template literal.) Tables that
-     do not — audit, templates, import preview — still stack rather than overflow: they lose the
-     column headings on a phone but stay readable, and those are desk work anyway. Adding a label is
-     one attribute when any of them earns it.
-
-     TAP TARGETS. Apple's guidance is ~44pt; the Done buttons were 12px text with 4px padding, which
-     is roughly half. Everything clickable gets a 44px minimum here rather than only the buttons that
-     were obviously too small, because the next small control added should inherit the rule. */
   /* Shown only on a phone. Used for the jump-to-the-form link on a contact record, and for the note
      that import is desk work. Display is set in the media query below, so it is invisible by default —
      a rule that fails closed, rather than one that leaks phone furniture onto the desktop. */
   .phone-only { display:none; }
 
   @media (max-width:640px) {
+    /* The rail collapses to a horizontal wrapping bar rather than staying a fixed vertical column —
+       the same shape the old flat header nav already used on a phone, just carrying icon+label items
+       and grouping labels hidden (they read as one flat wrapping list either way at this width). No new
+       client JS: no drawer, no hamburger, nothing to wire up. */
+    .shell { flex-direction:column; min-height:0; }
+    .rail { width:auto; height:auto; position:static; flex-direction:row; flex-wrap:wrap; align-items:center;
+      padding:8px 10px; gap:2px; border-right:0; border-bottom:1px solid var(--line); }
+    .rail-brand { padding:2px 8px; margin-right:auto; }
+    .rail-nav { flex:none; width:100%; order:3; overflow:visible; display:flex; flex-wrap:wrap; gap:2px; }
+    .rail-group { display:contents; }
+    .rail-group-label { display:none; }
+    .rail-link { padding:7px 9px; }
+    .rail-foot { border-top:0; margin:0; padding:0; order:2; margin-left:auto; display:flex; flex-wrap:wrap; align-items:center; gap:4px; max-width:100%; }
+    /* The signed-in name (AUTH-001) is the lock icon alone here; the name is in its title and on /account. */
+    .rail-me { display:none; }
+    .theme-toggle { margin:0; }
+
     .phone-only { display:block; margin:0 0 12px; }
+    /* The contact-record header bar (Phase 4) stacks rather than trying to keep the avatar/name/stage
+       row and the action buttons on one line at this width. */
+    .chead { flex-direction:column; align-items:stretch; }
+    .chead-acts { width:100%; }
+    .chead-acts .btn { flex:1 1 auto; }
     /* The relationship block keeps its label/value columns rather than stacking into two lines per
        field. A contact record carries seventeen fields and most are usually empty, so stacked they
        cost thirty-four lines of scrolling to say almost nothing. Narrower label column, same shape. */
     .grid2 { grid-template-columns:104px 1fr; gap:6px 10px; font-size:13px; }
     .grid2 dt { margin-top:0; }
     main { margin:14px auto 48px; padding:0 12px; }
-    header { padding:10px 14px; }
-    header nav { gap:10px 14px; font-size:15px; }
-    header nav a { padding:7px 0; }
     h1 { font-size:20px; }
     section, .card { padding:14px; }
 
     table { border:0; background:transparent; border-radius:0; overflow:visible; }
     thead { display:none; }
     table, tbody, tr, td { display:block; width:100%; }
-    tbody tr { background:#fff; border:1px solid var(--line); border-radius:10px; padding:6px 0; margin-bottom:10px; }
+    tbody tr { background:var(--surface); border:1px solid var(--line); border-radius:10px; padding:6px 0; margin-bottom:10px; }
     tbody tr:last-child { margin-bottom:0; }
     /* text-align is overridden because several cells carry an inline right-align that only makes
        sense in a column. In a stacked card everything reads from the left edge. */
@@ -162,6 +311,12 @@ const STYLE = `
     a.pill { min-height:44px; display:inline-flex; align-items:center; padding:6px 12px; margin:3px 4px 3px 0; }
     .actions { gap:8px; }
     .actions form, .actions button, .actions .btn { flex:1 1 auto; }
+
+    /* The listrow shape (Phase 2) isn't a table, so the table→card transform above doesn't touch it —
+       it needs its own phone rule. The meta column drops below the name/subtitle and reads from the left
+       edge, same convention as .grid2 above, rather than staying right-aligned in a narrowed column. */
+    .stat-row { grid-template-columns:repeat(2,1fr); gap:8px; }
+    .listrow-meta { flex:1 1 100%; align-items:flex-start; text-align:left; padding-left:40px; margin-top:2px; }
   }
 
   /* Proportional bar for the weekly hours report (TIME-001).
@@ -169,76 +324,274 @@ const STYLE = `
      quantity in the same unit, so colouring them differently would encode nothing and imply a category
      that does not exist. Width is set inline as a percentage of the largest row in its own group.
      min-width so a 0.25h row is still a visible mark rather than nothing at all. */
-  .barwrap { background:#eef2f7; border-radius:3px; overflow:hidden; margin-top:5px; height:6px; }
+  .barwrap { background:var(--surface-2); border-radius:3px; overflow:hidden; margin-top:5px; height:6px; }
   .bar { height:6px; background:var(--accent); border-radius:3px; min-width:2px; }
   /* Numbers that get compared down a column must not wander. */
-  .num { text-align:right; font-variant-numeric:tabular-nums; white-space:nowrap; }
+  .num { text-align:right; font-variant-numeric:tabular-nums; white-space:nowrap; font-family:"JetBrains Mono",ui-monospace,monospace; }
 
   /* Interaction history: one line per touch, expandable */
   .hist { border:1px solid var(--line); border-radius:8px; overflow:hidden; }
-  .hist-row { border-bottom:1px solid var(--line); font-size:14px; }
+  .hist-row { border-bottom:1px solid var(--line); font-size:14px; border-left:3px solid var(--line); }
   .hist-row:last-child { border-bottom:0; }
+  /* Left-bar color by interaction type (Phase 4, 2026-09-14), matching the ContactRecord mockup. Purely
+     additive — the <details>/<summary> collapse behavior below is unchanged. */
+  .hist-row.accent { border-left-color:var(--accent); }
+  .hist-row.green { border-left-color:var(--green); }
+  .hist-row.amber { border-left-color:var(--amber); }
   .hist-row > summary, .hist-flat { padding:9px 12px; display:flex; gap:8px; align-items:center; flex-wrap:wrap; cursor:pointer; list-style:none; }
   .hist-flat { cursor:default; }
   .hist-row > summary::-webkit-details-marker { display:none; }
   .hist-row > summary:before { content:"▸"; color:var(--muted); font-size:11px; width:10px; flex:none; }
   .hist-row[open] > summary:before { content:"▾"; }
   .hist-flat:before { content:""; width:10px; flex:none; }
-  .hist-row > summary:hover { background:#f8fafc; }
-  .hist-date { font-variant-numeric:tabular-nums; color:var(--muted); flex:none; }
+  .hist-row > summary:hover { background:var(--surface-2); }
+  .hist-date { font-variant-numeric:tabular-nums; color:var(--muted); flex:none; font-family:"JetBrains Mono",ui-monospace,monospace; }
   .hist-subject { flex:1 1 200px; min-width:0; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
-  .hist-detail { padding:2px 12px 14px 34px; border-top:1px dashed var(--line); background:#fcfdfe; }
+  .hist-detail { padding:2px 12px 14px 34px; border-top:1px dashed var(--line); background:var(--surface-2); }
   .hist-detail > div { margin:6px 0; }
   .hist-more { margin-top:8px; }
   .hist-more > summary { font-size:13px; color:var(--accent); cursor:pointer; padding:6px 0; }
 `;
 
-export function layout(opts: { title: string; body: string; banner?: string; nav?: boolean }): string {
-  const nav =
-    opts.nav === false
-      ? ""
-      : `<header>
-  <!--
-    A small mark beside the name. 22px tall, which is the cap height of the text next to it — the header
-    is on every page and every pixel of it is scroll a phone pays for, so the mark sits inside the line
-    that already existed rather than adding a band above it. The header grew by nothing.
+/*
+ * Rail icons — hand-drawn, not a library. Nothing in package.json provides one today, and this app's
+ * whole posture is zero-build-step and minimal-dependency; adding an icon package for 21 glyphs would
+ * be a bigger addition than the glyphs themselves. Stroke-based, currentColor, one visual language, so
+ * a rail item's color (muted / ink / accent depending on hover and active state) drives its icon for
+ * free with no separate icon-color logic anywhere.
+ */
+const NAV_ICONS: Record<string, string> = {
+  dashboard: `<svg width="17" height="17" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="3" y="3" width="7" height="9" rx="1.5"/><rect x="14" y="3" width="7" height="5" rx="1.5"/><rect x="14" y="12" width="7" height="9" rx="1.5"/><rect x="3" y="16" width="7" height="5" rx="1.5"/></svg>`,
+  contacts: `<svg width="17" height="17" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="12" cy="8" r="3.4"/><path d="M5 20c0-4 3-6.5 7-6.5s7 2.5 7 6.5"/></svg>`,
+  pipeline: `<svg width="17" height="17" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M4 5h16l-6 8v6l-4-2v-4z"/></svg>`,
+  actions: `<svg width="17" height="17" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="4" y="5" width="16" height="15" rx="2"/><path d="M8 3v4M16 3v4M4 10h16"/><path d="M8.5 14.5l2 2 4-4.5"/></svg>`,
+  add: `<svg width="17" height="17" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="9.5" cy="9" r="3.3"/><path d="M3.5 20c0-3.6 2.7-6 6-6"/><path d="M17.5 8.5v6M14.5 11.5h6"/></svg>`,
+  templates: `<svg width="17" height="17" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M4 5h16M4 5l4 5.5v6L14 18v-7.5L20 5"/></svg>`,
+  meetings: `<svg width="17" height="17" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="3" y="5" width="18" height="16" rx="2"/><path d="M8 3v4M16 3v4M3 10h18"/><circle cx="12" cy="15" r="1.6" fill="currentColor" stroke="none"/></svg>`,
+  analytics: `<svg width="17" height="17" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M4 20V10M10 20V4M16 20v-7M22 20H2"/></svg>`,
+  pursuits: `<svg width="17" height="17" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="12" cy="12" r="8.5"/><circle cx="12" cy="12" r="3.5"/></svg>`,
+  customers: `<svg width="17" height="17" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="4" y="8" width="16" height="11" rx="2"/><path d="M9 8V6a3 3 0 0 1 3-3v0a3 3 0 0 1 3 3v2"/></svg>`,
+  pricing: `<svg width="17" height="17" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="5" y="3" width="14" height="18" rx="2"/><path d="M8 7h8M8 11h2M12 11h2M16 11h0M8 15h2M12 15h2M8 18h2M12 18h4"/></svg>`,
+  companies: `<svg width="17" height="17" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M4 21V7l8-4 8 4v14"/><path d="M9 21v-6h6v6"/></svg>`,
+  time: `<svg width="17" height="17" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="12" cy="12" r="8.5"/><path d="M12 7v5l3.5 2"/></svg>`,
+  timereport: `<svg width="17" height="17" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M5 19V10M12 19V5M19 19v-7"/></svg>`,
+  timeimport: `<svg width="17" height="17" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="4" y="4" width="16" height="16" rx="2"/><path d="M4 9h16"/><path d="M12 12v5m0 0l-2-2m2 2l2-2"/></svg>`,
+  activities: `<svg width="17" height="17" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M9 6h11M9 12h11M9 18h11"/><circle cx="4.5" cy="6" r="1.3" fill="currentColor" stroke="none"/><circle cx="4.5" cy="12" r="1.3" fill="currentColor" stroke="none"/><circle cx="4.5" cy="18" r="1.3" fill="currentColor" stroke="none"/></svg>`,
+  import: `<svg width="17" height="17" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M12 16V5m0 0l-4 4m4-4l4 4"/><path d="M4 19h16"/></svg>`,
+  email: `<svg width="17" height="17" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="3" y="5" width="18" height="14" rx="2"/><path d="M3 6l9 7 9-7"/></svg>`,
+  update: `<svg width="17" height="17" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M4 12a8 8 0 0 1 14-5.3M20 12a8 8 0 0 1-14 5.3"/><path d="M18 3v4h-4M6 21v-4h4"/></svg>`,
+  export: `<svg width="17" height="17" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M12 5v11m0 0l-4-4m4 4l4-4"/><path d="M4 19h16"/></svg>`,
+  audit: `<svg width="17" height="17" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M12 3l7 3v6c0 4.5-3 7.5-7 9-4-1.5-7-4.5-7-9V6z"/><path d="M9 12l2 2 4-4.5"/></svg>`,
+  health: `<svg width="17" height="17" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M3 12h4l2-7 4 14 2-7h6"/></svg>`,
+  feedback: `<svg width="17" height="17" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M4 5h16v11H8l-4 4z"/></svg>`,
+  settings: `<svg width="17" height="17" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="12" cy="12" r="3"/><path d="M19.4 15a1.7 1.7 0 0 0 .3 1.8l.1.1a2 2 0 1 1-2.8 2.8l-.1-.1a1.7 1.7 0 0 0-1.8-.3 1.7 1.7 0 0 0-1 1.5V21a2 2 0 1 1-4 0v-.1a1.7 1.7 0 0 0-1.1-1.5 1.7 1.7 0 0 0-1.8.3l-.1.1a2 2 0 1 1-2.8-2.8l.1-.1a1.7 1.7 0 0 0 .3-1.8 1.7 1.7 0 0 0-1.5-1H3a2 2 0 1 1 0-4h.1a1.7 1.7 0 0 0 1.5-1.1 1.7 1.7 0 0 0-.3-1.8l-.1-.1a2 2 0 1 1 2.8-2.8l.1.1a1.7 1.7 0 0 0 1.8.3H9a1.7 1.7 0 0 0 1-1.5V3a2 2 0 1 1 4 0v.1a1.7 1.7 0 0 0 1 1.5 1.7 1.7 0 0 0 1.8-.3l.1-.1a2 2 0 1 1 2.8 2.8l-.1.1a1.7 1.7 0 0 0-.3 1.8V9a1.7 1.7 0 0 0 1.5 1H21a2 2 0 1 1 0 4h-.1a1.7 1.7 0 0 0-1.5 1z"/></svg>`,
+  outreach: `<svg width="17" height="17" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M21 3L10 14"/><path d="M21 3l-7 18-4-7-7-4z"/></svg>`,
+  commitments: `<svg width="17" height="17" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="12" cy="12" r="8.5"/><circle cx="12" cy="12" r="4.5"/><circle cx="12" cy="12" r="1" fill="currentColor" stroke="none"/></svg>`,
+  users: `<svg width="17" height="17" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="9" cy="8" r="3.2"/><path d="M3 20c0-3.6 2.7-6 6-6s6 2.4 6 6"/><path d="M16 4.5a3.2 3.2 0 0 1 0 6.3M18 14.2c1.9.8 3 2.8 3 5.8"/></svg>`,
+  account: `<svg width="17" height="17" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="5" y="11" width="14" height="10" rx="2"/><path d="M8 11V8a4 4 0 0 1 8 0v3"/></svg>`,
+  signout: `<svg width="17" height="17" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M9 4H5a2 2 0 0 0-2 2v12a2 2 0 0 0 2 2h4"/><path d="M16 17l5-5-5-5M21 12H9"/></svg>`,
+};
 
-    The image is the mark only — see src/icons.ts to replace it with your own.
+/**
+ * Dashboard section-header icons (Phase 2, 2026-09-14). Sections 1, 2 and 8 reuse an existing rail
+ * icon rather than drawing a near-duplicate (a clock is a clock whether it labels "Time" in the rail or
+ * "Upcoming Meetings" on the dashboard); the rest are new because nothing in NAV_ICONS represents them.
+ */
+export const SECTION_ICONS: Record<number, string> = {
+  1: NAV_ICONS.time,
+  2: NAV_ICONS.actions,
+  3: `<svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M5 12h11"/><path d="M13 6l6 6-6 6"/></svg>`,
+  4: NAV_ICONS.feedback,
+  5: NAV_ICONS.export,
+  6: `<svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M6 16v-5a6 6 0 0 1 12 0v5l1.5 2h-15z"/><path d="M10 20a2 2 0 0 0 4 0"/></svg>`,
+  7: `<svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M12 4L2 20h20z"/><path d="M12 10v5"/><circle cx="12" cy="18" r="0.6" fill="currentColor" stroke="none"/></svg>`,
+  8: NAV_ICONS.pursuits,
+};
 
-    Fixed width and height attributes so the line does not reflow while the image loads, and empty alt
-    text because the words next to it already say what it is; a screen reader announcing "logo, Practice
-    Platform" is noise.
-  -->
-  <b><a href="/" style="color:inherit;white-space:nowrap"><img src="/logo.png" alt="" width="44" height="20" style="vertical-align:-4px;margin-right:9px">Practice Platform</a></b>
-  <nav>
-    <a href="/">Dashboard</a>
-    <a href="/contacts">Contacts</a>
-    <a href="/actions">Action Items</a>
-    <a href="/pipeline">Pipeline</a>
-    <!--
-      TWO THINGS COULD HAVE BEEN CALLED "PIPELINE" AND ONLY ONE IS. /pipeline is the relationship
-      pipeline — contacts by stage, which is what this app was first for. /pursuits is the sales pipeline
-      — work being chased, by lifecycle stage (PURS-001). Naming both "Pipeline" would have been accurate
-      and useless, so the newer one is "Pursuits", which is also the word used for it when it was requested.
-    -->
-    <a href="/pursuits">Pursuits</a>
-    <a href="/engagements">Customers</a>
-    <a href="/organizations">Companies</a>
-    <a href="/templates">Templates</a>
-    <a href="/contacts/new">Add Contact</a>
-    <a href="/import">Import</a>
-    <a href="/email/import">Email</a>
-    <a href="/update">Update</a>
-    <a href="/export">Export</a>
-    <a href="/audit">Audit</a>
-    <a href="/health">Health</a>
-    <a href="/activities">Activities</a>
-    <a href="/feedback">Feedback</a>
-    <a href="/logout">Sign Out</a>
-  </nav>
-</header>${opts.banner ?? ""}`;
-  return `<!doctype html>
-<html lang="en">
+interface NavItem {
+  href: string;
+  label: string;
+  icon: keyof typeof NAV_ICONS;
+}
+interface NavGroup {
+  label?: string;
+  items: NavItem[];
+}
+
+/*
+ * Real full link set, regrouped by what the work actually is rather than by arrival order.
+ *
+ * "Pursuits", not "Pipeline", for this group — the flat nav's own comment already named this trap:
+ * /pipeline is the RELATIONSHIP pipeline (contacts by stage) and /pursuits is the SALES pipeline (work
+ * being chased). Naming this group "Pipeline" would collide with the real /pipeline link, which lives
+ * under Relationships instead, where it functionally belongs.
+ *
+ * Time / Time Report / Time Import are promoted here from contextual-only links (reachable before only
+ * via the dashboard's "hours logged" line or a Time page's own week-nav). A weekly-use workflow earns
+ * primary nav; Activities — the vocabulary that workflow draws its categories from — joins it.
+ */
+const NAV_GROUPS: NavGroup[] = [
+  { items: [{ href: "/", label: "Dashboard", icon: "dashboard" }] },
+  {
+    label: "Relationships",
+    items: [
+      { href: "/contacts", label: "Contacts", icon: "contacts" },
+      { href: "/pipeline", label: "Pipeline", icon: "pipeline" },
+      { href: "/actions", label: "Action Items", icon: "actions" },
+      { href: "/commitments", label: "Commitments", icon: "commitments" },
+      { href: "/outreach", label: "Outreach", icon: "outreach" },
+      { href: "/meetings", label: "Meetings", icon: "meetings" },
+      { href: "/analytics", label: "Analytics", icon: "analytics" },
+      { href: "/contacts/new", label: "Add Contact", icon: "add" },
+      { href: "/templates", label: "Templates", icon: "templates" },
+    ],
+  },
+  {
+    label: "Pursuits",
+    items: [
+      { href: "/pursuits", label: "Pursuits", icon: "pursuits" },
+      { href: "/engagements", label: "Customers", icon: "customers" },
+      { href: "/organizations", label: "Companies", icon: "companies" },
+      { href: "/pricing", label: "Pricing", icon: "pricing" },
+    ],
+  },
+  {
+    label: "Time",
+    items: [
+      { href: "/time", label: "Time", icon: "time" },
+      { href: "/time/report", label: "Time Report", icon: "timereport" },
+      { href: "/time/import", label: "Time Import", icon: "timeimport" },
+      { href: "/activities", label: "Activities", icon: "activities" },
+    ],
+  },
+  {
+    label: "Data",
+    items: [
+      { href: "/import", label: "Import", icon: "import" },
+      { href: "/email/import", label: "Email", icon: "email" },
+      { href: "/update", label: "Update", icon: "update" },
+      { href: "/export", label: "Export", icon: "export" },
+      { href: "/audit", label: "Audit", icon: "audit" },
+      { href: "/health", label: "Health", icon: "health" },
+      { href: "/users", label: "Users", icon: "users" },
+      { href: "/settings", label: "Settings", icon: "settings" },
+    ],
+  },
+];
+
+/**
+ * Longest-prefix match against the real request path, so /contacts/123 highlights Contacts while the
+ * more specific /contacts/new highlights Add Contact, and /time/report highlights Time Report rather
+ * than Time. No call site hand-picks an id — a hardcoded string per route (34+ of them) would drift
+ * from this table the first time someone added a route without updating both places.
+ */
+function activeHref(path: string): string | null {
+  let best: string | null = null;
+  for (const group of NAV_GROUPS) {
+    for (const item of group.items) {
+      if (path === item.href || path.startsWith(`${item.href}/`)) {
+        if (!best || item.href.length > best.length) best = item.href;
+      }
+    }
+  }
+  return best;
+}
+
+function railLink(item: NavItem, active: string | null): string {
+  return `<a class="rail-link${item.href === active ? " active" : ""}" href="${esc(item.href)}">${NAV_ICONS[item.icon]}${esc(item.label)}</a>`;
+}
+
+function railHtml(path: string, theme: "dark" | "light"): string {
+  const active = activeHref(path);
+  // Admin-only links (auth.ts ADMIN_ONLY) are left out for members, rather than shown and then refused.
+  const admin = isAdmin();
+  const groups = NAV_GROUPS.map((g) => ({ ...g, items: g.items.filter((i) => admin || !adminOnlyPath(i.href)) }))
+    .filter((g) => g.items.length)
+    .map(
+    (g) =>
+      `<div class="rail-group">${g.label ? `<div class="rail-group-label">${esc(g.label)}</div>` : ""}${g.items
+        .map((item) => railLink(item, active))
+        .join("")}</div>`
+  ).join("");
+  const ret = encodeURIComponent(path);
+  return `<aside class="rail">
+  <div class="rail-brand"><a href="/">
+    <img src="/logo.png${logoV()}" alt="" width="30" height="14" style="object-fit:contain">
+    <b>${esc(appSettings().appName)}</b>
+  </a></div>
+  <nav class="rail-nav">${groups}</nav>
+  <div class="rail-foot">
+    <div class="theme-toggle">
+      <a class="${theme === "dark" ? "active" : ""}" href="/theme/dark?return=${ret}">Dark</a>
+      <a class="${theme === "light" ? "active" : ""}" href="/theme/light?return=${ret}">Light</a>
+    </div>
+    <a class="rail-link${path === "/account" ? " active" : ""}" href="/account" title="Signed in as ${esc(whoami().actor)}" aria-label="My account: ${esc(whoami().displayName)}">${NAV_ICONS.account}<span class="rail-me">${esc(whoami().displayName)}</span></a>
+    <a class="rail-link" href="/feedback">${NAV_ICONS.feedback}Feedback</a>
+    <a class="rail-link" href="/logout">${NAV_ICONS.signout}Sign Out</a>
+  </div>
+</aside>`;
+}
+
+/**
+ * Show/Hide for password fields. Progressive: without JS the field is a normal hidden password input.
+ * Hiding again on submit means a revealed password is never left on screen after a failed sign-in, and
+ * the browser's password manager always sees a type=password field when it saves.
+ */
+const PW_TOGGLE_SCRIPT = `<script>
+document.querySelectorAll('input[type=password]').forEach(function (inp) {
+  var wrap = document.createElement('div');
+  wrap.className = 'pw-wrap';
+  inp.parentNode.insertBefore(wrap, inp);
+  wrap.appendChild(inp);
+  var b = document.createElement('button');
+  b.type = 'button';
+  b.className = 'pw-toggle';
+  function set(show) {
+    inp.type = show ? 'text' : 'password';
+    b.textContent = show ? 'Hide' : 'Show';
+    b.setAttribute('aria-pressed', show ? 'true' : 'false');
+    b.setAttribute('aria-label', show ? 'Hide password' : 'Show password');
+  }
+  b.addEventListener('click', function () { set(inp.type === 'password'); inp.focus(); });
+  if (inp.form) inp.form.addEventListener('submit', function () { set(false); });
+  set(false);
+  wrap.appendChild(b);
+});
+</script>`;
+
+/*
+ * Comments in this codebase are working notes, and some name real people, clients and decisions. HTML
+ * and CSS comments would otherwise ship in every page's source (Phase 3a packaging, 2026-09-25), so they
+ * are stripped on the way out. TypeScript comments never reach the browser.
+ */
+const STYLE_SHIPPED = STYLE.replace(/\/\*[\s\S]*?\*\//g, "");
+const stripComments = (html: string) => html.replace(/<!--[\s\S]*?-->/g, "");
+
+export function layout(opts: {
+  title: string;
+  body: string;
+  banner?: string;
+  nav?: boolean;
+  /**
+   * Required, not optional — on purpose. `layout()` derives the active theme and the active rail item
+   * from the real request, so it needs the request; making this optional would let a call site compile
+   * without a theme or highlighting, silently. Required means `npm run typecheck` names every call site
+   * that hasn't been updated, which is the actual completeness check for a change this wide.
+   */
+  c: Context<{ Bindings: Bindings }>;
+}): string {
+  const theme: "dark" | "light" = getCookie(opts.c, "pp_theme") === "light" ? "light" : "dark";
+  const path = opts.c.req.path;
+  // Phase 3b: admins see a banner on every page while database updates wait (not on Health, which
+  // already leads with the panel that applies them).
+  const pending = isAdmin() && path !== "/health" ? pendingCountCached() : 0;
+  const updates = pending
+    ? `<div class="flash warn" style="margin-bottom:12px">This copy's database has ${pending === 1 ? "an update" : `${pending} updates`} waiting. <a href="/health">Apply ${pending === 1 ? "it" : "them"} on Health</a>.</div>`
+    : "";
+  const content = `${updates}${opts.banner ?? ""}${opts.body}`;
+  const shell = opts.nav === false ? content : `<div class="shell">${railHtml(path, theme)}<div class="main-area">${content}</div></div>`;
+  return stripComments(`<!doctype html>
+<html lang="en" data-theme="${theme}">
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
@@ -251,20 +604,27 @@ export function layout(opts: { title: string; body: string; banner?: string; nav
   viewport-fit=cover is deliberately NOT set: it would push content under the notch and the home bar.
 -->
 <link rel="manifest" href="/manifest.webmanifest">
-<link rel="apple-touch-icon" href="/apple-touch-icon.png">
-<link rel="icon" type="image/png" href="/icon.png">
-<meta name="theme-color" content="#1a2332">
+<link rel="apple-touch-icon" href="/apple-touch-icon.png${iconV()}">
+<link rel="icon" type="image/png" href="/icon.png${iconV()}">
+<meta name="theme-color" content="${theme === "light" ? "#f4f5f8" : "#0e1116"}">
 <meta name="apple-mobile-web-app-capable" content="yes">
 <meta name="mobile-web-app-capable" content="yes">
-<meta name="apple-mobile-web-app-title" content="Practice">
+<meta name="apple-mobile-web-app-title" content="${esc(appSettings().shortName)}">
 <!-- "black", not "black-translucent": translucent draws the page UNDER the status bar, which would put
      the clock on top of the header. Opaque keeps the layout honest. -->
 <meta name="apple-mobile-web-app-status-bar-style" content="black">
-<title>${esc(opts.title)} · Practice Platform</title>
-<style>${STYLE}</style>
+<!--
+  Sora (UI text) and JetBrains Mono (dates/numbers) — this app's first external network reference in
+  rendered HTML. Every font-family in STYLE keeps a real system fallback stack, so a slow or blocked
+  request degrades invisibly rather than breaking a page; nothing here is load-bearing for content.
+-->
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Sora:wght@400;500;600;700&family=JetBrains+Mono:wght@400;500&display=swap">
+<title>${esc(opts.title)} · ${esc(appSettings().appName)}</title>
+<style>${STYLE_SHIPPED}</style>
 </head>
-<body>${nav}${opts.body}</body>
-</html>`;
+<body>${shell}${PW_TOGGLE_SCRIPT}</body>
+</html>`);
 }
 
 /** Renders a <select>. options = [value, label, hint?][] */
@@ -287,7 +647,7 @@ export function select(
 /**
  * Meeting times are stored as free text, so they arrive in whatever shape they were written —
  * "10 am", "10:30am", "2 PM". On the hour they read as a bare hour, which sits oddly beside the times
- * that do carry minutes (raised 2026-07-30). This normalizes the display only: minutes are always
+ * that do carry minutes (the owner, 2026-07-30). This normalizes the display only: minutes are always
  * shown, and am/pm is lower-cased and spaced. Anything that is not recognizably a clock time is
  * returned untouched, so a note like "after standup" still displays as written.
  */
@@ -307,7 +667,7 @@ export function dayDelta(date: string, from: string = new Date().toISOString().s
  * A follow-up date with its distance from today, so a list is scannable without doing date arithmetic
  * in your head. "Reach Out Later · in 28d" carries the same information as a stage named "reach out in
  * 4 weeks" — but the date is a fact on the record rather than an offset to be recomputed later
- * (raised 2026-07-30).
+ * (the owner's question 2026-07-30).
  */
 export function followUpPill(date: string | null, stage?: string | null): string {
   if (!date) return '<span class="pill grey">none set</span>';
@@ -329,4 +689,60 @@ export function followUpPill(date: string | null, stage?: string | null): string
   const days = dayDelta(date, today);
   if (days < 0) return `<span class="pill red">overdue ${Math.abs(days)}d · ${esc(date)}</span>`;
   return `<span class="pill green">${esc(date)} · in ${days}d</span>`;
+}
+
+/**
+ * The same red/amber/green/grey classification followUpPill uses above, for the status dot on a
+ * dashboard listrow (Phase 2). Kept as its own function rather than having followUpPill return its
+ * color alongside its markup, since every other call site only ever wanted the rendered pill.
+ */
+export function followUpDotClass(date: string | null, stage?: string | null): "red" | "amber" | "green" | "grey" {
+  if (!date) return "grey";
+  if (stage && TERMINAL_STAGES.some((v) => v === stage)) return "grey";
+  const today = new Date().toISOString().slice(0, 10);
+  if (date === today) return "amber";
+  return dayDelta(date, today) < 0 ? "red" : "green";
+}
+
+/**
+ * Two-letter initials for the dashboard's avatar circles (Phase 2) — "Renee Huang" → "RH". Nothing in
+ * this app derived initials before now. First letter of the first two whitespace-separated words;
+ * a single-word name (an organization entered as a contact, or a placeholder) falls back to its own
+ * first letter rather than throwing or rendering blank.
+ */
+export function initials(fullName: string): string {
+  const parts = fullName.trim().split(/\s+/).filter(Boolean);
+  if (parts.length === 0) return "";
+  if (parts.length === 1) return parts[0][0].toUpperCase();
+  return (parts[0][0] + parts[1][0]).toUpperCase();
+}
+
+/**
+ * The Stage dot color (Phase 3, 2026-09-14; lifted here in Phase 4 once the contact record needed the
+ * same mapping the contacts list already had). Explicit per stage rather than derived from
+ * ACTIVE_STAGES/TERMINAL_STAGES, so a 13th stage forces a deliberate choice here instead of silently
+ * defaulting to something that might be wrong.
+ */
+const STAGE_DOT: Record<string, "accent" | "amber" | "green" | "grey"> = {
+  meeting_scheduled: "accent",
+  in_conversation: "accent",
+  follow_up_action: "accent",
+  awaiting_response: "amber",
+  reach_out_later: "amber",
+  not_contacted: "amber",
+  stay_connected: "green",
+  pray: "green",
+};
+for (const stage of TERMINAL_STAGES) STAGE_DOT[stage] = "grey";
+export function stageDotClass(stage: string): "accent" | "amber" | "green" | "grey" {
+  return STAGE_DOT[stage] ?? "grey";
+}
+
+/**
+ * The "★ Priority" pill for an inner-circle contact (migration 0029), or "" for everyone else, so call
+ * sites can interpolate it unconditionally. Takes anything carrying is_priority because the work lists
+ * pass their own row shapes, not full Contacts.
+ */
+export function priorityBadge(r: { is_priority?: number | null }): string {
+  return r.is_priority ? `<span class="pill prio" title="Priority contact">Priority</span>` : "";
 }

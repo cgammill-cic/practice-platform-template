@@ -1,23 +1,29 @@
--- 0007 — message templates.
+-- 0007 — message templates (REL-008 Part A, issue #19).
 --
--- Canned outreach copy you can tune to your own voice, organized by escalation-ladder position and
--- channel, so the words you use most are one click from being pasted where you need them.
+-- "I think I should have a 'message template' link where I can easily create a message template,
+-- copy and paste into Outlook." — the owner, 2026-08-01. And, separately: "If I could have the option
+-- to add more communications templates, that would be good."
 --
 -- Why a table rather than constants in the source
 -- -----------------------------------------------
--- The wording of an outreach message has a shelf life — it goes stale as circumstances change, and if it
--- lives in TypeScript, rewording it needs a deploy, which is a reliable way to ensure it never gets
--- reworded. Copy that goes stale silently is the same class of failure as a commitment that goes quiet.
+-- The original REL-008 acceptance criteria said templates are "stored in the app", which reads as
+-- hardcoded. That is wrong here for a specific reason: the first-touch message announced a career move
+-- ("I recently started my own advisory business"). That sentence has a shelf life. By autumn it is
+-- the wrong opening, and if it lives in TypeScript then rewording it needs a deploy — which is a
+-- reliable way to ensure it never gets reworded. Copy that goes stale silently is the same class of
+-- failure as a commitment that goes quiet.
 --
--- `rung` is NULLABLE on purpose. The escalation ladder points at specific rungs, but most of what you'll
--- write — a thank-you after a meeting, an intro request, a re-engagement note — belongs to no rung at
--- all. Tying every template to a ladder position would make the library refuse the majority of its own
--- use cases.
+-- rung is NULLABLE on purpose. The escalation ladder (REL-008 Part B) will point at specific rungs,
+-- but the owner asked to "add more communications templates", and most of what he will write — a
+-- thank-you after a meeting, an intro request, a re-engagement note — belongs to no rung at all. Tying
+-- every template to a ladder position would make the library refuse the majority of its own use cases.
 --
--- `channel` is constrained but includes 'other', so a new medium does not require a migration to record.
--- 'text' is a valid channel even with no seeded template below — a text that reads like a template
--- defeats the purpose of sending one, so it's worth writing those fresh each time rather than seeding a
--- canned one.
+-- There is deliberately no rung 4 template. The owner: "don't worry about the text message. I generally
+-- make that more personal." The ladder will still track that a text was sent; it just will not offer
+-- canned words for it, because a text that reads like a template defeats the purpose of sending one.
+--
+-- channel is constrained but includes 'other', so a new medium does not require a migration to record.
+-- 'text' remains a valid channel even with no seeded template, so one can be added later.
 
 CREATE TABLE message_template (
   id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -38,18 +44,25 @@ CREATE TABLE message_template (
 -- The list page asks "what is active, in display order" on every load.
 CREATE INDEX idx_template_active ON message_template(active, sort_order, name);
 
--- Starter templates — generic on purpose. Edit these to your own voice on the Templates page; nothing
--- about the feature requires keeping this wording.
+-- SEED TEXT REWRITTEN GENERICALLY, 2026-09-25 (Phase 3a packaging). The original seed was the owner's own
+-- wording, verbatim (a career announcement, an email address, a signature), which was right for
+-- his copy and wrong for anyone else's: every new copy would have opened with his career news. This file
+-- was already applied to the owner's database on 2026-08-01, and migrations never re-run, so his templates
+-- are untouched by this edit; only databases created from now on get the text below. The schema above
+-- is unchanged, so the schema manifest is unaffected. Placeholders ({first_name}) are filled on the
+-- Templates page; each owner is expected to rewrite these in their own voice.
 INSERT INTO message_template (name, channel, rung, subject, body, sort_order) VALUES
-('Initial outreach — reconnecting', 'email', 1, 'Catching up',
-'I hope you''re doing well — it''s been a while! I wanted to reach out and see how things are going on your end.
+('Initial outreach — reconnect', 'email', 1, 'Catching up',
+'Hi {first_name},
 
-I''d love to reconnect and hear what you''ve been working on. Let me know if you have some time in the next week or two and I''ll send a calendar invite.
+I hope you''re doing well. It has been too long, and I wanted to reach out.
+
+I''d enjoy hearing what you''ve been working on lately. If you have time in the next couple of weeks for a short call, let me know what works and I''ll send an invite. And if the timing isn''t right, no need to reply.
 
 Looking forward to catching up.', 10),
 
 ('Follow-up — did this reach you', 'email', 2, 'Following up',
-'I wanted to circle back and see if my last email reached you okay. Let me know either way — thanks!', 20),
+'Hi {first_name}, I wanted to circle back in case my last note got buried. No pressure at all; I''d just enjoy catching up when the timing works for you.', 20),
 
-('LinkedIn — reconnecting', 'linkedin', 3, NULL,
-'Hey, I hope you''re doing well. I sent a couple of emails your way but wanted to reach out here too in case they didn''t land. Would love to reconnect when you have a moment.', 30);
+('LinkedIn — reconnect', 'linkedin', 3, NULL,
+'Hi {first_name}, I hope you''re doing well. I sent a note by email but wanted to try here too. Would you be open to catching up sometime in the next few weeks? No pressure if the timing is off.', 30);

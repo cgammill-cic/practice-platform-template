@@ -2,21 +2,24 @@
   "name": "practice-platform",
   "main": "src/index.ts",
   "compatibility_date": "2026-07-01",
+  // nodejs_als: AsyncLocalStorage, which carries the signed-in identity to every audit write (auth.ts).
+  "compatibility_flags": ["nodejs_als"],
   "observability": { "enabled": true },
   // Nightly backup: 07:00 UTC = 2:00 AM US Central (daylight time)
-  // 07:00 UTC nightly backup. The two weekday entries are the daily digest: Cloudflare crons are UTC and
-  // do not shift with daylight saving, so a single fixed time drifts an hour twice a year. Both fire and
-  // the run checks whether it is currently the 6 o'clock hour in US Central — exactly one passes on any
-  // given day, and the other returns immediately. See src/digest.ts, decision 4.
-  "triggers": { "crons": ["0 7 * * *", "0 11 * * 1-5", "0 12 * * 1-5"] },
-  // No database_id here — this is a template, so there's no shared database to point at. The
-  // "Deploy to Cloudflare" button provisions a fresh D1 database on YOUR account and fills this in
-  // automatically. Setting up by hand instead: `wrangler d1 create <name>`, then paste the id it prints
-  // as `database_id` below — see docs/local-setup.md and docs/runbook.md.
+  // "0 * * * *" is the daily digest check (Phase 3a): every hour, and the run sends only when it is the
+  // configured hour (default 6) on a weekday in the copy's configured timezone. Replaced the old pair of
+  // weekday crons tuned to US Central, so a copy in any timezone works unchanged. See src/digest.ts.
+  // "15 * * * *" is the hourly meeting sync from the Outlook calendar (src/meetingsync.ts), at :15 so it
+  // never lands on the same tick as the backup or digest. scheduled() in src/index.ts must dispatch it.
+  // "*/5 * * * *" is the outreach tick (src/outreach.ts): scheduled drafting runs, and finishing a
+  // Draft Now whose browser tab was closed. Without an ANTHROPIC_API_KEY it returns immediately.
+  "triggers": { "crons": ["0 7 * * *", "0 * * * *", "15 * * * *", "*/5 * * * *"] },
+  // No database_id: this is a template. "Deploy to Cloudflare" creates a database in YOUR account and
+  // fills it in. The app builds its own tables on first visit (/setup), so no migration command is needed.
   "d1_databases": [
     {
       "binding": "DB",
-      "database_name": "practice-platform-prod",
+      "database_name": "practice-platform-db",
       "migrations_dir": "migrations"
     }
   ],

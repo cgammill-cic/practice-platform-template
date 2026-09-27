@@ -5,6 +5,20 @@
 import { DIRECTIONS, INTERACTION_TYPES, MEETING_FORMATS, labelFor, stageLabel, type Interaction } from "./types";
 import { esc } from "./views";
 
+/**
+ * The history row's left-bar color by interaction type (Phase 4, 2026-09-14), matching the approved
+ * ContactRecord mockup. Explicit per type rather than derived, so a new interaction type forces a
+ * deliberate choice here — same pattern as the Stage dot mapping in views.ts. "note" and any future
+ * type intentionally fall through to no color (the base grey border).
+ */
+const TYPE_DOT: Record<string, "accent" | "green" | "amber"> = {
+  meeting: "accent",
+  linkedin: "accent",
+  email: "green",
+  call: "amber",
+  text: "amber",
+};
+
 /** One-line overview + expandable detail for a single interaction, with an edit link. */
 export function historyEntry(i: Interaction): string {
   const followUp = i.next_follow_up_set
@@ -22,7 +36,8 @@ export function historyEntry(i: Interaction): string {
     ${followUp} ${staged}`;
 
   // Every entry is expandable — even a bare one — so the edit link is always reachable.
-  return `<details class="hist-row">
+  const dotClass = TYPE_DOT[i.type] ?? "";
+  return `<details class="hist-row ${dotClass}">
     <summary>${overview}</summary>
     <div class="hist-detail">
       ${i.direction ? `<div class="meta">${esc(labelFor(DIRECTIONS, i.direction))}</div>` : ""}

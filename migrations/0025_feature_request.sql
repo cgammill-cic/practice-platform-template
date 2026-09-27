@@ -1,24 +1,23 @@
--- 0025 — a place to write down "it would be good if..." (2026-09-09).
+-- 0025 — a place to write down "it would be good if..." (the owner, 2026-09-09).
 --
--- The request: "it would be good to include an area where people can recommend enhancements that I could
+-- His words: "it would be good to include an area where people can recommend enhancements that I could
 -- then incorporate into the application if it's deemed necessary."
 --
--- WHY PER-INSTANCE, NOT CENTRALIZED BACK TO ONE OPERATOR. This ships in the same shared codebase every
--- PKG-001 instance runs, so everyone who gets their own deployment gets this page too — for their
+-- WHY PER-INSTANCE, NOT CENTRALIZED BACK TO THE MAINTAINER. This ships in the same shared codebase every
+-- PKG-001 instance runs, so every friend who gets their own deployment gets this page too — for their
 -- own use, on their own data, same as everything else in this app. A CENTRALIZED version (every
--- instance's requests landing in one place a single maintainer reads) would need a shared service every
--- instance calls home to, which is exactly the shared infrastructure PKG-001 (#96) rejected on confidentiality
+-- instance's requests landing in one place the owner reads) would need a shared service every instance
+-- calls home to, which is exactly the shared infrastructure PKG-001 (#96) rejected on confidentiality
 -- grounds: a request text field is a much smaller risk than a contact record, but "no shared backend,
 -- full stop" is the property that makes the risk analysis simple, and a single exception starts eroding
--- it. So this is a local backlog, same shape wherever it runs. Getting a request from one deployment
--- back to whoever maintains the shared codebase is a conversation between them, not a network call this
--- app makes on their behalf.
+-- it. So this is a local backlog, same shape wherever it runs. Getting a request from a friend's instance
+-- back to the owner is a conversation between them, not a network call this app makes on their behalf.
 --
 -- No foreign keys to contact or organization — a clean leaf table, so it carries no REL-031 obligation
 -- (see docs/definitions.md §4a): nothing here needs a line in health.ts's HANDLED set.
 --
 -- STATUS IS A SMALL, FIXED VOCABULARY rather than a boolean done/not-done, because "recommend, then I
--- decide if it's worth building" (the original framing) is a review workflow with more than two states:
+-- decide if it's worth building" (the owner's own framing) is a review workflow with more than two states:
 -- new (unreviewed), considering (read, undecided), planned (accepted, not built yet), done, declined.
 -- Closed states (done, declined) are both "this is settled", but conflating them would erase whether a
 -- request was ever actually acted on — the same distinction action_item's `done` vs `deleted` already

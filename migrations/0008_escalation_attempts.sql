@@ -11,10 +11,10 @@
 --
 -- Why a stored column rather than deriving the rung from interactions
 -- ------------------------------------------------------------------
--- Deriving avoids a migration, but interaction history is editable
+-- Decision by the owner 2026-08-01. Deriving avoids a migration, but interaction history is editable
 -- (REL-012), so correcting a mistyped date on an old interaction would silently move a contact's
 -- position in the ladder. A stored value states where they are as a fact. Same argument that settled
--- REL-015: a value derivable only by calculation is what hid a contact from every list.
+-- REL-015: a value derivable only by calculation is what hid a contact from every list on 2026-07-30.
 --
 -- Backfill, and what it does NOT claim
 -- -----------------------------------

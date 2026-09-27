@@ -7,31 +7,32 @@
  * reached instead of four, and nothing on the chase row says why.
  *
  * WHAT WAS ALREADY DONE, so it is not repeated here. The issue listed three options. Option 2 — map URLs
- * straight from the source export — shipped with the importer: a LinkedIn connections export was matched
- * against the priority contacts, and importer.ts carries the result including its own honesty about it,
- * flagging nickname matches and refusing ambiguous ones rather than guessing. Option 3 — scraping, or a
- * paid enrichment vendor — was assessed and rejected in the issue: LinkedIn's terms prohibit the first,
- * and the second adds cost, another data processor and a privacy question, so it is a decision to be
- * taken deliberately rather than a default. This module is option 1, which is all that is left: make the
- * remaining manual work two clicks and a paste.
+ * straight from the source export — shipped with the importer: `Connections.csv` (3,276 LinkedIn
+ * connections) was matched against the priority contacts, and importer.ts carries the result including
+ * its own honesty about it, flagging nickname matches and refusing ambiguous ones rather than guessing.
+ * Option 3 — scraping, or a paid enrichment vendor — was assessed and rejected in the issue: LinkedIn's
+ * terms prohibit the first, and the second adds cost, another data processor and a privacy question, so
+ * it is a decision to be taken deliberately rather than a default. This module is option 1, which is all
+ * that is left: make the remaining manual work two clicks and a paste.
  *
- * WHAT IS LEFT IS SMALLER BUT HARDER. The contacts still missing a URL after the automatic match are
- * largely the ones where the source data was genuinely absent or genuinely ambiguous — the easy matches
- * are already in. Expect a real share of them to have no profile at all, which is what the "No profile"
- * button and migration 0011 exist for.
+ * WHAT IS LEFT IS SMALLER BUT HARDER, and the numbers say so. Counted on prod 2026-08-11: 295 contacts,
+ * 97 with no linkedin_url, of which 61 are active and not in a terminal stage. The contacts still
+ * missing a URL are largely the ones where the source data was genuinely absent or genuinely ambiguous —
+ * the easy matches are already in. Expect a real share of the 61 to have no profile at all, which is
+ * what the "No profile" button and migration 0011 exist for.
  *
- * TERMINAL STAGES ARE EXCLUDED. Complete, No Response, Retired and Not Qualified have no
+ * TERMINAL STAGES ARE EXCLUDED — 36 of the 97. Complete, No Response, Retired and Not Qualified have no
  * next step by definition (types.ts, TERMINAL_STAGES), so there is no future outreach for a LinkedIn URL
  * to enable. Same rule the dashboard follow-up lists use, for the same reason, and the footer states the
  * count rather than dropping them quietly.
  */
 
 import { Hono } from "hono";
-import { esc, layout } from "./views";
-import { TERMINAL_STAGES, stageLabel, type Bindings, type Contact, type D1Db } from "./types";
+import { esc, layout, priorityBadge } from "./views";
+import { PRIORITY_FIRST_ORDER, TERMINAL_STAGES, stageLabel, type Bindings, type Contact, type D1Db } from "./types";
+import { actor } from "./auth";
 
 const app = new Hono<{ Bindings: Bindings }>();
-const ACTOR = "operator";
 
 /**
  * How many rows the page renders at once. 61 qualify today, so this changes nothing now; it is here so
@@ -51,11 +52,13 @@ const TERMINAL_LIST = TERMINAL_STAGES.map((s) => `'${s}'`).join(",");
  *
  * Ordering: contacts currently being chased first, then by priority tier, then by name. The tier order
  * is the issue's requirement; the chase term is ahead of it because a missing URL only costs time at the
- * moment you are trying to reach someone and have run out of channels. That term may reorder nothing at
- * all on a given day — it is written for the state this list will be in once it is being worked alongside
- * section 3, not because live data demonstrated the need on day one.
+ * moment you are trying to reach someone and have run out of channels. Stated honestly: that term
+ * reorders NOTHING today — 0 of the 61 are in awaiting_response (measured on prod 2026-08-11) — so it is
+ * written for the state this list will be in once it is being worked alongside section 3, not because
+ * live data demonstrated the need.
  *
- * Untiered contacts sort after tiered ones, the same undated-last-style inversion used elsewhere.
+ * Untiered contacts sort after tiered ones, the same undated-last-style inversion used elsewhere. There
+ * are none on prod today either; every one of the 61 carries a tier.
  */
 export async function missingLinkedIn(db: D1Db, limit = PAGE_LIMIT): Promise<MissingRow[]> {
   const { results } = await db
@@ -65,7 +68,7 @@ export async function missingLinkedIn(db: D1Db, limit = PAGE_LIMIT): Promise<Mis
         WHERE c.status='active' AND c.no_linkedin = 0
           AND (c.linkedin_url IS NULL OR TRIM(c.linkedin_url) = '')
           AND c.stage NOT IN (${TERMINAL_LIST})
-        ORDER BY (c.stage <> 'awaiting_response'), (c.priority_tier IS NULL), c.priority_tier, c.full_name
+        ORDER BY ${PRIORITY_FIRST_ORDER}, (c.stage <> 'awaiting_response'), (c.priority_tier IS NULL), c.priority_tier, c.full_name
         LIMIT ?`
     )
     .bind(limit)
@@ -121,15 +124,15 @@ export function webSearchUrl(name: string, org: string | null): string {
  *
  * WHAT IT NORMALIZES, and why each one:
  *   - a missing scheme is added, because copying from an address bar sometimes drops it
- *   - the host is lowercased, and a bare `linkedin.com` gains `www.`, so stored URLs share one shape,
- *     matching the `https://www.linkedin.com/in/...` form already in use
+ *   - the host is lowercased, and a bare `linkedin.com` gains `www.`, so stored URLs share one shape;
+ *     all 198 URLs already in prod are `https://www.linkedin.com/in/...` (checked 2026-08-11)
  *   - query string and fragment are dropped: LinkedIn appends tracking parameters
  *     (`?miniProfileUrn=…`, `?trk=…`) that identify the session that copied the link, not the person
  *   - a trailing slash is dropped, so the same profile cannot be stored two ways
  *
  * WHAT IT DOES NOT DO. It does not require the path to be `/in/…`. Legacy `/pub/` profiles exist and are
- * real, and a rule that rejects a URL the operator can see working in their own browser would be the app
- * being confidently wrong. A bare domain with no path IS rejected, because that identifies nobody.
+ * real, and a rule that rejects a URL the owner can see working in his browser would be the app being
+ * confidently wrong. A bare domain with no path IS rejected, because that identifies nobody.
  */
 export function normalizeLinkedIn(raw: string): { url: string } | { error: string } {
   const trimmed = raw.trim();
@@ -157,7 +160,7 @@ async function audit(db: D1Db, contactId: number, summary: string, before: strin
     .prepare(
       "INSERT INTO audit_event (actor, entity, entity_id, action, before_summary, after_summary, source, correlation_id) VALUES (?,'contact',?,'update',?,?,'app',?)"
     )
-    .bind(ACTOR, String(contactId), before, summary, `contact-${contactId}`)
+    .bind(actor(), String(contactId), before, summary, `contact-${contactId}`)
     .run();
 }
 
@@ -170,7 +173,7 @@ function row(r: MissingRow): string {
   const chasing =
     r.stage === "awaiting_response" ? ' <span class="pill amber">being chased — no LinkedIn rung</span>' : "";
   return `<tr>
-    <td><a href="/contacts/${r.id}"><b>${esc(r.full_name)}</b></a>
+    <td><a href="/contacts/${r.id}"><b>${esc(r.full_name)}</b></a> ${priorityBadge(r)}
       ${org || r.title ? `<div class="meta">${esc([r.title, org].filter(Boolean).join(" · "))}</div>` : ""}
       <div class="meta">${tier} <span class="pill grey">${esc(stageLabel(r.stage))}</span>${chasing}</div></td>
     ${/* nowrap on both links: the trailing ↗ was wrapping onto its own line in this column at desktop
@@ -226,13 +229,17 @@ app.get("/linkedin", async (c) => {
   const error = c.req.query("error");
 
   return c.html(
-    layout({
+    layout({ c,
       title: "Missing LinkedIn",
       body: `<main>
   ${FLASH[c.req.query("flash") ?? ""] ?? ""}
   ${error ? `<div class="flash warn">${esc(error)}</div>` : ""}
   <h1>Missing LinkedIn URLs</h1>
-  <p class="sub">${total} active contact${total === 1 ? "" : "s"} with no profile URL on file · <a href="/">dashboard</a> · <a href="/contacts">all contacts</a></p>
+  <p class="meta" style="margin:0 0 4px">${total} active contact${total === 1 ? "" : "s"} with no profile URL on file</p>
+  <div class="linkbar">
+    <a class="linkchip" href="/">Dashboard</a>
+    <a class="linkchip" href="/contacts">All Contacts</a>
+  </div>
 
   <p class="phone-only meta">Two taps and a paste per contact: open a search, copy the profile URL, paste it back. The search links open in a new tab.</p>
 

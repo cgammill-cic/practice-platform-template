@@ -5,7 +5,7 @@
 -- REL-020 (#40) added the follow_up_action stage to STAGES in src/types.ts but not to the database.
 -- contact.stage carries a CHECK constraint listing the ten original stages, so every attempt to write
 -- the new value was rejected by SQLite and surfaced as an Internal Server Error. Found in production
--- on 2026-07-31 when resolving Edgar Huerta's meeting and ticking "also apply this stage to the
+-- on 2026-07-31 when resolving a contact's meeting and ticking "also apply this stage to the
 -- contact": the interaction saved, the write-through to the contact threw, and the stage was unusable
 -- everywhere until this ran.
 --

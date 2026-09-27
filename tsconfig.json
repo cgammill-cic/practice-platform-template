@@ -5,7 +5,8 @@
     "moduleResolution": "bundler",
     "strict": true,
     "noEmit": true,
-    "lib": ["ES2022", "WebWorker"]
+    "lib": ["ES2022", "WebWorker"],
+    "skipLibCheck": true
   },
   "include": ["src"]
 }

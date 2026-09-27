@@ -1,17 +1,18 @@
 /*
  * What counts as an outreach attempt — one definition, shared by everything that asks (#82).
  *
- * THE BUG THIS EXISTS TO PREVENT. An outbound email was recorded on the Record an Interaction form, and
- * the chase list said "no attempt recorded" — on a row that, one line further along, said "1 attempt ·
- * tried email". One row, two contradictory facts, because the row drew them from two different places:
+ * THE BUG THIS EXISTS TO PREVENT. On 2026-08-04 the owner emailed one contact (377), recorded it on the
+ * Record an Interaction form, and the chase list said "no attempt recorded" — on a row that, one line
+ * further along, said "1 attempt · tried email". One row, two contradictory facts, because the row drew
+ * them from two different places:
  *
  *   - the silence pill read `contact.last_attempt_at`, a stored column maintained ONLY by
  *     POST /escalation/:id/attempt (the chase buttons), and
  *   - the attempt count was DERIVED in chaseList() by counting attempt-type interactions.
  *
  * Anything recorded through the interaction form moved the derived number and left the stored column
- * untouched, so it was invisible to the ladder: a contact who had just been emailed could sort to the
- * very top of the chase list, above people who genuinely had never been contacted.
+ * untouched, so it was invisible to the ladder: Tracey sorted to the very top of the chase list, above
+ * people who genuinely had never been contacted, on the day he was emailed.
  *
  * The fix is not "also write the column over there". It is to state the definition once, here, and have
  * the write side (contacts.ts, escalation.ts), the read side (escalation.ts chaseList) and the drift
@@ -30,11 +31,11 @@
  * disagree on the same row. Two reasons, in order of how much they matter:
  *
  *   1. THE FORM DEFAULTS TO TWO-WAY. `interactionForm()` renders Direction with "two_way" preselected,
- *      so the value on a row records whatever the operator left it as, not a considered claim about who
- *      initiated. Real usage bears this out: plenty of texts and emails end up marked two_way even
- *      though their summary describes a one-sided outreach ("sent a text", "sent another email"). Those
- *      are outreach. An outbound-only rule records nothing for them, which is the same silence #82 is
- *      about.
+ *      so the value on a row records what the owner left it as, not a considered claim about who
+ *      initiated. Prod on 2026-08-04 bears this out: one contact (20) has a text marked two_way
+ *      whose summary is "Sent a text after talking at tennis", and another (279) has an email
+ *      marked two_way summarised "Sent yet another email". Those are outreach. An outbound-only rule
+ *      records nothing for them, which is the same silence #82 is about.
  *   2. THE DERIVED COUNT NEVER FILTERED ON DIRECTION AT ALL. If the stored column counted outbound only
  *      while the count on the same row counted every direction, the two would still contradict each
  *      other — a narrower version of the identical bug.
@@ -43,7 +44,7 @@
  * A NULL direction counts, matching 0008, which had no direction filter to inherit.
  *
  * Applying this to the existing derived count changes no displayed number today: prod has no inbound
- * interaction of an attempt type as of this writing. The clause is there for tomorrow.
+ * interaction of an attempt type (2026-08-04, all 289 contacts). The clause is there for tomorrow.
  *
  * WHAT AN ATTEMPT IS NOT: a meeting or a note, neither of which is a chase, and neither of which has
  * ever counted here.
@@ -83,9 +84,9 @@ export function isAttempt(type: string | null | undefined, direction: string | n
  * Bring a contact's escalation ladder back in line with their interaction history — FORWARD ONLY.
  *
  * WHY THIS EXISTS (REL-035, 2026-08-26). Recording an interaction maintained the ladder; EDITING one did
- * not. Moving an interaction's date forward left `last_attempt_at` pointing at the old, earlier date —
- * so the chase list would have called a contact fifteen days silent on the morning they were emailed,
- * which is the one thing that list exists to get right.
+ * not. On 2026-08-26 the owner edited interaction 159 to move its date from 2026-08-11 to 2026-08-26 and
+ * `last_attempt_at` stayed at 2026-08-11 — so the chase list would have called that contact fifteen
+ * days silent on the morning he was emailed, which is the one thing that list exists to get right.
  *
  * The old comment on the edit path defended not doing this, citing #57 and #82, and it was right about
  * the danger it named: a correction to old history must not silently reorder the worklist. But it also

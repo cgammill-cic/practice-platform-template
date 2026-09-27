@@ -4,19 +4,19 @@
 --
 -- WHY THIS EXISTS. The calendar import matches a client category against `organization.name`, exactly and
 -- case-insensitively (definitions.md §5d). That works only while the two strings agree, and in real data
--- they do not: the operator types a short name on a calendar event, and the organization record carries the
--- full legal entity name. Nobody types a legal entity name into a calendar category, and nobody wants the
--- customer record to say the short form when the invoice needs the full one. Both are right; they are just
--- different strings for different purposes.
+-- they do not: The owner types `Datum` on a calendar event, and the organization is `Datum Engineers, Inc.`
+-- Nobody types a legal entity name into a calendar category, and nobody wants the customer record to say
+-- "Datum" when the invoice needs "Datum Engineers, Inc." Both are right; they are just different strings
+-- for different purposes.
 --
--- "I updated the Client tab to include this org, but it is not pulling through to the
--- customer dropdown on the import from Outlook file." (2026-08-13)
+-- The owner, 2026-08-13: "I updated the Client tab to include Datum, but it is not pulling through to the
+-- customer dropdown on the import from Outlook file."
 --
 -- EXPLICIT, NOT FUZZY. The rejected alternative was loose matching — treat the category as a match if the
 -- organization name starts with it, or shares a first word. That needs no setup and is wrong in the one
--- place it must not be: two clients whose names begin the same way (an existing organization and a future,
--- similarly-named one) would silently match whichever the query returned first, and on a Client Delivery row
--- that reaches an invoice. A stated tag cannot guess. A guess cannot be audited.
+-- place it must not be: two clients whose names begin the same way ("Datum Engineers" and a future "Datum
+-- Health") would silently match whichever the query returned first, and on a Client Delivery row that
+-- reaches an invoice. A stated tag cannot guess. A guess cannot be audited.
 --
 -- NULL MEANS "USE THE NAME". Existing organizations keep working with no data entry: the matcher falls
 -- back to `name` whenever `calendar_tag` is null, so this migration changes no behaviour on its own. The

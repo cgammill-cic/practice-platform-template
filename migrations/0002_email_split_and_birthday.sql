@@ -1,7 +1,7 @@
 -- 0002_email_split_and_birthday.sql — feedback round 1 (2026-07-30)
 -- Applied to practice-platform-dev and practice-platform-prod on 2026-07-30 via Cloudflare API.
 --
--- Rationale: "Email / Secondary email" was ambiguous. Contacts frequently have both a
+-- Rationale: "Email / Secondary email" was ambiguous. The owner's contacts frequently have both a
 -- corporate address and a personal one, and which is which matters for outreach (personal addresses
 -- are far less likely to be filtered as spam — see the escalation ladder in REL-008).
 --

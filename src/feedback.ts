@@ -1,22 +1,22 @@
-// Enhancement requests (migration 0025).
+// Enhancement requests (migration 0025, the owner 2026-09-09).
 //
-// The idea: somewhere to recommend enhancements that the operator can incorporate into the application
-// later if it's deemed worthwhile. A running backlog, reviewed by hand — not a voting board, not a
-// roadmap, just somewhere an idea goes so it survives past the conversation that produced it.
+// His words: "it would be good to include an area where people can recommend enhancements that I could
+// then incorporate into the application if it's deemed necessary." A running backlog, reviewed by hand —
+// not a voting board, not a roadmap, just somewhere an idea goes so it survives past the conversation
+// that produced it.
 //
 // PER-INSTANCE, DELIBERATELY. This page ships in the same codebase every PKG-001 deployment runs, so a
 // friend's own copy gets its own local backlog — for their own use, on their own data. It does not phone
-// anything back to the operator's own instance; getting a request from a friend's instance back to the
-// original operator is a conversation between them, not a network call this app makes. See migration
-// 0025 for the fuller argument, which is the same one PKG-001 (#96) already settled: no shared backend
-// between instances, full stop.
+// anything back to the owner; getting a request from a friend's instance to the owner is a conversation
+// between them, not a network call this app makes. See migration 0025 for the fuller argument, which is
+// the same one PKG-001 (#96) already settled: no shared backend between instances, full stop.
 
 import { Hono } from "hono";
 import { esc, layout, select } from "./views";
 import type { Bindings, D1Db } from "./types";
+import { actor } from "./auth";
 
 const app = new Hono<{ Bindings: Bindings }>();
-const ACTOR = "operator";
 
 const STATUSES = [
   ["new", "New"],
@@ -65,7 +65,7 @@ async function audit(
     .prepare(
       "INSERT INTO audit_event (actor, entity, entity_id, action, before_summary, after_summary, source, correlation_id) VALUES (?,'feature_request',?,?,?,?,'app',?)"
     )
-    .bind(ACTOR, entityId, action, before ?? null, after, `feature-request-${entityId}`)
+    .bind(actor(), entityId, action, before ?? null, after, `feature-request-${entityId}`)
     .run();
 }
 
@@ -111,7 +111,7 @@ app.get("/feedback", async (c) => {
       : `<div class="empty">${esc(emptyText)}</div>`;
 
   return c.html(
-    layout({
+    layout({ c,
       title: "Enhancement Requests",
       body: `<main>
   <h1>Enhancement Requests</h1>
@@ -152,7 +152,7 @@ app.post("/feedback", async (c) => {
   const res = await c.env.DB.prepare(
     "INSERT INTO feature_request (submitted_by, summary, detail) VALUES (?,?,?)"
   )
-    .bind(ACTOR, summary, detail)
+    .bind(actor(), summary, detail)
     .run();
   const id = res?.meta?.last_row_id ?? 0;
   await audit(c.env.DB, String(id), "create", `${summary}${detail ? ` — ${detail}` : ""}`);

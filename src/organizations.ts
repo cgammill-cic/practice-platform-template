@@ -1,24 +1,26 @@
 /*
- * ORG-001 — organizations you can actually edit.
+ * ORG-001 — organizations you can actually edit (the owner 2026-09-02).
  *
- * Organizations used to be created name-only from three places — the contact form, the engagement form,
- * and the importer — and nothing in the app could ever edit one afterward: THERE WAS NO ORGANIZATION
- * SCREEN AT ALL.
+ * "Is there a way I can edit the company set up (currently, I think it's just pulling from when I add a
+ * new contact)." He was right about the cause and it was worse than he thought: THERE WAS NO ORGANIZATION
+ * SCREEN AT ALL. Organizations were created name-only from three places — the contact form, the engagement
+ * form, and the importer — and nothing in the app could ever edit one.
  *
- * Measured on real data before building this: a large share of organizations had `domain`, `industry`,
- * `address`, `relationship_status` and `notes` empty on EVERY SINGLE ROW, despite all five columns having
- * existed since the initial schema. Only `calendar_tag` had ever been written, and only on a handful of
- * rows, edited from the Customers form because there was nowhere else to put it.
+ * Measured on prod before building this: **2,120 organizations, and `domain`, `industry`, `address`,
+ * `relationship_status` and `notes` were empty on EVERY SINGLE ROW.** All five columns have existed since
+ * migration 0001 in July. Only `calendar_tag` had ever been written, on 3 organizations, and that was
+ * edited from the Customers form because there was nowhere else to put it.
  *
- * So this is another instance of a recurring gap in this codebase — columns the schema has carried for a
- * long time with no interface to reach them. The pattern is worth naming: a migration is cheap and a form
- * is not, so the schema runs ahead and the gap is invisible until someone asks for the field. NO MIGRATION
- * HERE — there is nothing to add.
+ * So this is the fourth instance of the same gap in this codebase — columns the schema has carried for
+ * months with no interface to reach them, after `qb_customer_id` (CUST-001), `interaction.outlook_ref`
+ * (MAIL-001) and `referral_source_contact_id` (REL-005). The pattern is worth naming: a migration is
+ * cheap and a form is not, so the schema runs ahead and the gap is invisible until someone asks for the
+ * field. NO MIGRATION HERE — there is nothing to add.
  *
- * WHY IT MATTERS NOW. The pursuit work (PURS-001) needed a physical address, and that address is
- * `organization.address`. It was unreachable, which made a schema question out of an interface problem.
- * The pursuit deliberately does not carry its own address; a company has one, and one copy of it is the
- * point.
+ * WHY IT MATTERS NOW. The pursuit work (PURS-001) needed the physical address the owner asked for, and that
+ * address is `organization.address`. It was unreachable, which made a schema question out of an interface
+ * problem. The pursuit deliberately does not carry its own address; a company has one, and one copy of it
+ * is the point.
  *
  * WHAT IS NOT HERE: merging two organizations. That is ORG-002, and it needs a place to record "these two
  * are not duplicates" so the review queue does not ask twice — which does need a migration. Renaming
@@ -28,11 +30,11 @@
 import { Hono } from "hono";
 import { esc, layout, select } from "./views";
 import { ORG_RELATIONSHIP, labelFor, type Bindings, type D1Db, type Organization } from "./types";
+import { actor } from "./auth";
 
 const app = new Hono<{ Bindings: Bindings }>();
-const ACTOR = "operator";
 
-/** With a large row count the list is search-first. Same shape and same reason as REL-017's contact list. */
+/** With 2,120 rows the list is search-first. Same shape and same reason as REL-017's contact list. */
 const LIMIT = 200;
 
 const str = (v: unknown): string | null => {
@@ -46,7 +48,7 @@ async function audit(db: D1Db, id: number, action: string, after: string | null,
     .prepare(
       "INSERT INTO audit_event (actor, entity, entity_id, action, before_summary, after_summary, source, correlation_id) VALUES (?,'organization',?,?,?,?,'app',?)"
     )
-    .bind(ACTOR, String(id), action, before, after, `organization-${id}`)
+    .bind(actor(), String(id), action, before, after, `organization-${id}`)
     .run();
 }
 
@@ -56,8 +58,7 @@ type Row = Organization & { contact_count: number; engagement_count: number; ope
  * One organization with the counts that say whether it is worth anything to you.
  *
  * The counts are the reason this list is worth reading rather than being an alphabetical dump: an
- * organization with no contacts and no engagements is almost always import residue, and it is common for
- * a handful of them to exist.
+ * organization with no contacts and no engagements is almost always import residue, and 27 of them exist.
  */
 export async function organizationList(
   db: D1Db,
@@ -118,13 +119,15 @@ function organizationForm(opts: { org: Partial<Row>; error?: string; saved?: boo
   const o = opts.org;
   return `<main>
   <h1>${esc(o.name ?? "Organization")}</h1>
-  <p class="sub">${o.contact_count ?? 0} contact${(o.contact_count ?? 0) === 1 ? "" : "s"} · ${
+  <p class="meta" style="margin:0 0 4px">${o.contact_count ?? 0} contact${(o.contact_count ?? 0) === 1 ? "" : "s"} · ${
     o.engagement_count ?? 0
   } engagement${(o.engagement_count ?? 0) === 1 ? "" : "s"}${
     o.open_pursuits ? ` (${o.open_pursuits} open pursuit${o.open_pursuits === 1 ? "" : "s"})` : ""
-  } · <a href="/organizations">all organizations</a> · <a href="/contacts?org=${encodeURIComponent(
-    o.name ?? ""
-  )}">its people</a></p>
+  }</p>
+  <div class="linkbar">
+    <a class="linkchip" href="/organizations">All Organizations</a>
+    <a class="linkchip" href="/contacts?org=${encodeURIComponent(o.name ?? "")}">Its People</a>
+  </div>
   ${opts.saved ? '<div class="flash ok">Changes saved.</div>' : ""}
   ${opts.error ? `<div class="flash warn">${esc(opts.error)}</div>` : ""}
   <form method="post" action="/organizations/${o.id}/edit" class="card">
@@ -132,15 +135,14 @@ function organizationForm(opts: { org: Partial<Row>; error?: string; saved?: boo
       RENAMING IS ALLOWED, and it is the main thing this screen is for. The names came from a spreadsheet
       import and a lot of them are wrong or abbreviated. A rename moves nothing: every contact and
       engagement points at this row by id, so they all follow automatically — which is exactly why it is
-      NOT a merge. Renaming one misspelling of a company's name to match another still leaves any other
-      row with the old spelling untouched — now there are two spellings of the same string. Merging is
-      ORG-002.
+      NOT a merge. Renaming "Harber and Wexley" to "Harbor & Wexley" leaves the other Harbor row
+      untouched and now there are two spellings of the same string. Merging is ORG-002.
     */ ""}
     <div class="row">
       <div><label>Name <span class="hint">required — every contact and engagement here follows the change</span></label>
         <input type="text" name="name" value="${esc(o.name)}" required autofocus></div>
       <div><label>Website / Domain <span class="hint">optional</span></label>
-        <input type="text" name="domain" value="${esc(o.domain)}" placeholder="e.g. acmeengineers.com"></div>
+        <input type="text" name="domain" value="${esc(o.domain)}" placeholder="e.g. datumengineers.com"></div>
     </div>
     <div class="row">
       <div><label>Industry</label><input type="text" name="industry" value="${esc(o.industry)}" placeholder="e.g. Engineering services"></div>
@@ -218,12 +220,18 @@ app.get("/organizations", async (c) => {
     : `<div class="card empty"><p><b>Nothing matches.</b></p><p class="meta">Organizations are created automatically when you type a new company on a contact or an engagement, so the list is as long as your contact list is varied.</p></div>`;
 
   return c.html(
-    layout({
+    layout({ c,
       title: "Organizations",
       body: `<main>
   ${c.req.query("flash") === "saved" ? '<div class="flash ok">Changes saved.</div>' : ""}
   <h1>Organizations</h1>
-  <p class="sub">${total} ${emptyOnly ? "with no people and no work" : "companies"} · <a href="/organizations/duplicates">possible duplicates</a> · <a href="/contacts">contacts</a> · <a href="/engagements">customers</a> · <a href="/pursuits">pursuits</a></p>
+  <p class="meta" style="margin:0 0 4px">${total} ${emptyOnly ? "with no people and no work" : "companies"}</p>
+  <div class="linkbar">
+    <a class="linkchip" href="/organizations/duplicates">Possible Duplicates</a>
+    <a class="linkchip" href="/contacts">Contacts</a>
+    <a class="linkchip" href="/engagements">Customers</a>
+    <a class="linkchip" href="/pursuits">Pursuits</a>
+  </div>
   <form method="get" action="/organizations" class="card" style="margin-bottom:14px">
     <div class="row">
       <div><label>Search <span class="hint">name, domain or industry</span></label>
@@ -253,7 +261,7 @@ app.get("/organizations/:id/edit", async (c) => {
   const org = await organization(c.env.DB, Number(c.req.param("id")));
   if (!org) return c.notFound();
   return c.html(
-    layout({
+    layout({ c,
       title: org.name,
       body: organizationForm({ org, saved: c.req.query("flash") === "saved" }),
     })
@@ -269,7 +277,7 @@ app.post("/organizations/:id/edit", async (c) => {
   const name = str(f.name);
   const reshow = (error: string) =>
     c.html(
-      layout({
+      layout({ c,
         title: before.name,
         body: organizationForm({ org: { ...before, ...(f as Partial<Row>), id }, error }),
       })
@@ -284,9 +292,9 @@ app.post("/organizations/:id/edit", async (c) => {
    * A rename onto a name that already exists is REFUSED — and this is the one judgement call on the
    * screen worth defending. It is not a uniqueness constraint (there is none on the column, deliberately;
    * see migration 0018's note on calendar_tag), it is a guard against the thing a rename looks like but
-   * is not. Typing one company's correct name over a misspelled duplicate FEELS like consolidating them;
-   * it actually leaves two rows with identical names, each holding half the contacts, and no screen able
-   * to tell them apart afterwards. Merging is ORG-002, and until it exists this refusal is what stops a
+   * is not. Typing "Harbor & Wexley" over "Harber and Wexley" FEELS like consolidating them; it
+   * actually leaves two rows with identical names, each holding half the contacts, and no screen able to
+   * tell them apart afterwards. Merging is ORG-002, and until it exists this refusal is what stops a
    * rename from quietly creating the mess the merge is meant to clean up.
    */
   const clash = await c.env.DB.prepare(

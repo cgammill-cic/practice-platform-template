@@ -8,18 +8,19 @@
     "schema:manifest": "node scripts/schema-manifest.mjs",
     "schema:check": "node scripts/schema-manifest.mjs --check",
     "db:local": "node scripts/local-db.mjs",
-    "check": "npm run typecheck && npm run schema:check"
+    "migrations:bundle": "node scripts/migrations-bundle.mjs",
+    "migrations:check": "node scripts/migrations-bundle.mjs --check",
+    "template:scan": "node scripts/template-scan.mjs",
+    "template:build": "node scripts/build-template.mjs",
+    "check": "npm run typecheck && npm run schema:check && npm run migrations:check"
   },
   "dependencies": {
+    "@anthropic-ai/sdk": "^0.128.0",
     "hono": "^4",
     "playwright": "^1.62.1"
   },
   "devDependencies": {
     "typescript": "^5",
     "wrangler": "^4"
-  },
-  "allowScripts": {
-    "esbuild@0.28.1": true,
-    "workerd@1.20260910.1": true
   }
 }

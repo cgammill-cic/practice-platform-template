@@ -1,20 +1,20 @@
--- 0023 — remembering that two companies are NOT the same company (ORG-002, 2026-09-02).
+-- 0023 — remembering that two companies are NOT the same company (ORG-002, the owner 2026-09-02).
 --
 -- ============================================================================================
 -- WHY THIS TABLE EXISTS AT ALL
 -- ============================================================================================
--- On being offered a duplicate-organization cleanup:
+-- The owner, on being offered a duplicate-organization cleanup:
 --
---   "I would need to be able to validate duplicate entries because some companies have sub-businesses
---    that are legitimate. I would prefer to have a list of potential duplicates that I can go through,
---    update (consolidate if necessary or mark as not a duplicate)."
+--   "I would need to be able to validate duplicate entries because some companies (like Alvarez &
+--    Marsal) have sub-businesses that are legitimate. I would prefer to have a list of potential
+--    duplicates that I can go through, update (consolidate if necessary or mark as not a duplicate)."
 --
 -- That sentence rules out the obvious build. Any rule that collapses similar names would merge two real
 -- businesses, and there would be nothing on any screen afterwards to say it had happened. So candidates
 -- are only ever SUGGESTED, and the person decides.
 --
 -- The decision then has to be remembered, and that is what this table is for. Without it the candidate
--- list is regenerated from the names every time — so the pairs already judged come back
+-- list is regenerated from the names every time — so the twenty pairs he has already judged come back
 -- on every visit, and come back again each time an import adds a contact to either side. A review queue
 -- that re-asks questions it has already been answered is a queue nobody opens twice, which would make
 -- the whole feature worse than nothing: it would look like coverage.
@@ -66,9 +66,9 @@
 CREATE TABLE organization_not_duplicate (
   a_id INTEGER NOT NULL REFERENCES organization(id) ON DELETE CASCADE,
   b_id INTEGER NOT NULL REFERENCES organization(id) ON DELETE CASCADE,
-  -- Why they are different, in the operator's own words, when they care to say. Optional, and worth
-  -- having: for a sub-business case the reason ("separate practice, bills separately") is the thing a
-  -- future reader — including a future maintainer — would otherwise have to reconstruct from nothing.
+  -- Why they are different, in the owner's words, when he cares to say. Optional, and worth having: for
+  -- the Harbor & Wexley case the reason ("separate practice, bills separately") is the thing a future
+  -- reader — including a future me — would otherwise have to reconstruct from nothing.
   note TEXT,
   decided_at TEXT NOT NULL DEFAULT (datetime('now')),
   PRIMARY KEY (a_id, b_id)

@@ -10,9 +10,9 @@
 // REL-018, after a live failure on 2026-07-30: the commit step re-checks EVERY row against the
 // database immediately before inserting it. The preview's duplicate check is a snapshot taken when
 // the page rendered; it cannot protect against the same page being submitted twice. An import was
-// interrupted partway through, the page was submitted again, and the already-written rows plus an
-// earlier test batch were inserted a second time — duplicates that the preview had correctly flagged
-// the first time round. Detection has to happen where the write happens.
+// interrupted after writing 73 rows, the page was submitted again, and those 73 plus 15 earlier test
+// contacts were inserted a second time — 88 duplicates that the preview had correctly flagged the
+// first time round. Detection has to happen where the write happens.
 
 import { Hono } from "hono";
 import { esc, layout } from "./views";
@@ -26,9 +26,9 @@ import {
   type D1Db,
   type D1Stmt,
 } from "./types";
+import { actor } from "./auth";
 
 const app = new Hono<{ Bindings: Bindings }>();
-const ACTOR = "operator";
 /** The spreadsheet's Comments column carries bare MM/DD dates. The workbook is a 2026 file. */
 const COMMENT_DATE_YEAR = 2026;
 const TEST_SUBSET = 15;
@@ -39,10 +39,10 @@ const TEST_SUBSET = 15;
  * because a silent default is how a contact ends up somewhere nobody meant to put it.
  *
  * NA was added 2026-08-03 (#65). definitions.md §2 had always listed it as not_qualified but hedged —
- * only when confirmed during import preview — because NA in the spreadsheet sometimes means "vetted
- * out" and sometimes just "no data". The hedge was never implemented, so NA fell through to the
- * unrecognized path and landed in not_contacted: the prioritized backlog, which is the one place a
- * vetted-out contact should never be. The rule was settled: NA is not_qualified, no confirmation step.
+ * "only when the owner confirms during import preview" — because NA in the spreadsheet sometimes means
+ * "vetted out" and sometimes just "no data". The hedge was never implemented, so NA fell through to
+ * the unrecognized path and landed in not_contacted: the prioritized backlog, which is the one place a
+ * vetted-out contact should never be. The owner settled it — NA is not_qualified, no confirmation step.
  * A wrong not_qualified is visible and one edit away; a wrong not_contacted quietly joins the queue.
  *
  * Pray was added 2026-08-04, completing the set: it was the last outcome code in the Priority column
@@ -57,30 +57,31 @@ const TEST_SUBSET = 15;
  *
  * SUPERSEDED IN PART ON 2026-08-20 (REL-032) — READ THIS BEFORE THE MAP BELOW.
  *
- * The numeric codes no longer name a stage. What the Priority column MEANS changed after the initial
- * load: it is now an action-priority ranking, not an assertion about the state of a relationship. Once
- * the logic changed from a definition to an action-priority listing, a large batch of contacts started
- * showing as though a conversation was already underway when in fact none had been contacted yet.
+ * The numeric codes no longer name a stage. The owner changed what the Priority column MEANS after the
+ * initial load: it is now an action-priority ranking, not an assertion about the state of a
+ * relationship. His words: "After the initial load, I changed the logic of priority to be an action
+ * priority listing vs. having a definition. Now I have over 400 NEW contacts that are showing I'm
+ * already in conversations with but in fact, I have not contacted yet."
  *
- * A later large import made that concrete: hundreds of rows arrived mapped to stages like In
- * Conversation, Awaiting Response and Reach Out Later — contacts the app claimed were mid-dialogue when
- * they had never been spoken to. A wrong not_contacted is a contact waiting in the queue; a wrong
+ * The 2026-08-20 import of 4,583 rows made that concrete: 460 rows arrived as In Conversation, 152 as
+ * Awaiting Response and 493 as Reach Out Later — 1,105 contacts the app claimed he was mid-dialogue
+ * with and he had never spoken to. A wrong not_contacted is a contact waiting in the queue; a wrong
  * in_conversation is the app lying about a relationship, and it also suppresses the chase logic that
- * would otherwise prompt first contact.
+ * would otherwise tell him to make first contact.
  *
  * So a numeric code now sets the TIER and the stage is always not_contacted. `1` no longer means a
  * meeting is booked, which also retires the meeting_scheduled-without-a-date repair below.
  *
  * THE NON-NUMERIC CODES ARE NOT PRIORITIES AT ALL and keep their meaning — but a brand-new row
  * carrying one is a contradiction worth stopping on, because those codes describe a history the
- * contact can only have if they are already in the system: rows carrying one should already have been
- * loaded with the initial load and should not be loaded again. Proven on a real import: a single CMPL
- * row turned out to be a duplicate of an existing contact from an earlier load, missed by the matcher
- * because the name had lost a parenthetical nickname and the new row carried no email. So the code
- * still maps to its stage — a real Complete contact must still be importable — but the row is flagged
- * and left UNTICKED on the preview, the same treatment a detected duplicate gets. Flagged rather than
- * rejected outright: rejecting it would make a genuinely new finished-with contact permanently
- * unimportable, and this is a matcher-miss signal, not a fact.
+ * contact can only have if he is already in the system. The owner: "Those should all have been already
+ * loaded with the initial load and therefore should not be loaded again." Proven on the same import:
+ * the single CMPL row was "Jane Doe / Acme / SVP", a duplicate of "Jane (Smith) Doe /
+ * Acme" from the 2026-07-30 load that the matcher missed because the name had lost its parenthetical
+ * and the new row carried no email. So the code still maps to its stage — a real Complete contact must
+ * still be importable — but the row is flagged and left UNTICKED on the preview, the same treatment a
+ * detected duplicate gets. Flagged rather than rejected outright: rejecting it would make a genuinely
+ * new finished-with contact permanently unimportable, and this is a matcher-miss signal, not a fact.
  */
 const STAGE_FROM_CODE: Record<string, string> = {
   // Numeric codes are rankings now, not states — every one of them lands in the backlog. Kept as an
@@ -107,13 +108,13 @@ const STAGE_FROM_CODE: Record<string, string> = {
 const ALREADY_LOADED_CODES = new Set(["A-FRQ", "CMPL", "GHST", "RTRD", "PRAY", "NA"]);
 
 /**
- * Priority code → tier (REL-032). The rule: if the priority tier is 1-4, use that priority; 5 and above
- * all show as tier 5.
+ * Priority code → tier (REL-032). The owner's rule, verbatim: "If their priority tier is 1-4, give them
+ * that priority. If they are 5+, just show them as 5."
  *
  * This replaces GPT Priority as the source of the tier. That column drove High → 2 / Medium → 3 and
- * was absent from a later import file entirely, so every imported contact landed on the default of 4 —
- * every tier in the batch was wrong, not just the stages, and nothing said so. The priority code is the
- * column that is actually kept up to date, so the tier now comes from the thing that gets curated.
+ * was ABSENT from the 2026-08-20 file, so all 4,279 imported contacts landed on the default of 4 —
+ * every tier in the batch was wrong, not just the stages, and nothing said so. The priority code is
+ * the column the owner actually maintains, so the tier now comes from the thing he curates.
  *
  * Tier 1 is no longer reserved for manual judgment: a code of 1 is his highest-priority mark and
  * should read as tier 1. Tier 5 stops being reserved for the same reason — it is now where 5-9 land.
@@ -141,13 +142,11 @@ const NOT_AN_ORG = new Set(["tbd", "na", "n/a", "none", "unknown", "retired", "r
 
 /** Near-duplicate organization names that would otherwise split reporting counts. */
 const ORG_CANONICAL: Record<string, string> = {
-  felix: "Felix Global",
-  planet: "The Planet Group",
 };
 
 /**
- * GPT Priority → priority tier. Tiers 1 and 5 are deliberately left unused so the extremes stay a
- * matter of manual judgment rather than an artifact of a spreadsheet score. Stated on the preview.
+ * GPT Priority → priority tier. Tiers 1 and 5 are deliberately left unused so the extremes stay
+ * The owner's manual judgment rather than an artifact of a spreadsheet score. Stated on the preview.
  */
 const TIER_FROM_PRIORITY: Record<string, number> = { High: 2, Medium: 3 };
 const TIER_DEFAULT = 4;
@@ -199,9 +198,9 @@ export function parseCsv(text: string): string[][] {
 }
 
 /**
- * Pulls the leading MM/DD out of a Comments string. The convention is that the comment starts with the
- * date of the next thing to happen: "07/30 - call @ 10:30 am", "08/17 - ping on next steps". Returns
- * the ISO date and, when present, the time as written.
+ * Pulls the leading MM/DD out of a Comments string. The owner's convention is that the comment starts
+ * with the date of the next thing to happen: "07/30 - call @ 10:30 am", "08/17 - ping on next steps".
+ * Returns the ISO date and, when present, the time as written.
  */
 export function parseComment(comment: string): { date: string | null; time: string | null } {
   const m = /^\s*(\d{1,2})\s*\/\s*(\d{1,2})/.exec(comment);
@@ -246,7 +245,7 @@ export interface StagedRow {
   next_follow_up: string | null;
   notes: string;
   import_meta: string;
-  /** Things the reviewer should look at before committing. Never blocks on its own. */
+  /** Things the owner should look at before committing. Never blocks on its own. */
   flags: string[];
   /** Hard problems — the row cannot be imported. */
   errors: string[];
@@ -281,9 +280,9 @@ export function stageRow(rec: Record<string, string>, rowNum: number): StagedRow
 
   /*
    * REL-032. A numeric code is a ranking, so it says nothing about the relationship: the row is
-   * new-to-the-app until a reviewer says otherwise. Flagged only where the OLD logic would have
-   * produced a different stage, so the preview explains the change on exactly the 1-4 rows it affects
-   * rather than repeating itself on every row in a large import file.
+   * new-to-the-app until the owner says otherwise. Flagged only where the OLD logic would have produced
+   * a different stage, so the preview explains the change on exactly the 1-4 rows it affects rather
+   * than repeating itself on every row in a 4,583-row file.
    */
   const tier = tierFromCode(code);
   if (tier !== null && ["1", "2", "3", "4"].includes(code))
@@ -292,7 +291,7 @@ export function stageRow(rec: Record<string, string>, rowNum: number): StagedRow
   /*
    * A code that asserts a history on a row the app has never seen. Left unticked on the preview by the
    * caller, because in practice it means the duplicate matcher missed an existing record — see the
-   * ALREADY_LOADED_CODES comment for the real case that proved it.
+   * ALREADY_LOADED_CODES comment for the Alli Rombough case that proved it.
    */
   if (ALREADY_LOADED_CODES.has(code.toUpperCase()))
     flags.push(
@@ -309,12 +308,12 @@ export function stageRow(rec: Record<string, string>, rowNum: number): StagedRow
      * change). These four stages mean the relationship is finished with, not neglected — a date on one
      * is a reminder to chase someone you have decided not to chase.
      *
-     * This is the mechanism behind #14: after REL-001, a batch of imported contacts in Complete and No
-     * Response carried a past date here and dominated the Overdue list, burying the handful of items
-     * that were real. Those dates were cleared by hand and the dashboard now filters terminal stages
-     * out, so the damage is hidden — but the import would still write them, and the filter is the
-     * second line of defence, not the first. Adding NA → not_qualified makes this reachable again on
-     * the next import, and a large import can run into the thousands of rows.
+     * This is the mechanism behind #14: after REL-001, 59 imported contacts in Complete and No Response
+     * carried a past date here and made up roughly three quarters of the Overdue list, burying the four
+     * items that were real. Those dates were cleared by hand and the dashboard now filters terminal
+     * stages out, so the damage is hidden — but the import would still write them, and the filter is
+     * the second line of defence, not the first. Adding NA → not_qualified makes this reachable again
+     * on the next import, and the §7 mass import is ~4,576 rows.
      *
      * Flagged rather than dropped in silence: the date was in the source and the preview should say
      * what happened to it.
@@ -349,8 +348,8 @@ export function stageRow(rec: Record<string, string>, rowNum: number): StagedRow
   /*
    * REL-032: the priority code is now the source of the tier, with GPT Priority as the fallback for a
    * row whose code is non-numeric (a disposition code carries no ranking). TIER_DEFAULT remains the
-   * last resort. A later import file had no gpt_priority column at all, which is precisely why the
-   * primary source had to move to the column that is actually kept up to date.
+   * last resort. The 2026-08-20 file had no gpt_priority column at all, which is precisely why the
+   * primary source had to move to the column the owner actually maintains.
    */
   const resolvedTier = tier ?? TIER_FROM_PRIORITY[clean(rec.gpt_priority)] ?? TIER_DEFAULT;
   const meta = {
@@ -410,13 +409,13 @@ const EXPECTED = [
 
 app.get("/import", (c) =>
   c.html(
-    layout({
+    layout({ c,
       title: "Import Contacts",
       body: `<main>
   <h1>Import Contacts</h1>
   <p class="sub">Upload a CSV. Nothing is written until you review the preview and confirm.</p>
   <!--
-    Phone note (UX-001, #56). The import WORKS on iOS — the file input opens
+    Phone note (UX-001, #56, the owner's call 2026-08-04). The import WORKS on iOS — the file input opens
     the Files picker and the flow completes — but the preview is a wide table you are meant to read
     carefully before writing hundreds of contacts, and a CSV is rarely on the phone in the first place.
     Rather than hide the page on small screens or pretend the flow is pleasant, it says which machine
@@ -518,18 +517,18 @@ async function findDupes(db: D1Db, rows: StagedRow[]): Promise<Map<number, DupIn
  * The authoritative duplicate check (REL-018), rebuilt as a preloaded index (REL-030, 2026-08-20).
  *
  * WHY IT CHANGED. It used to run up to three awaited queries per row, immediately before each insert.
- * On a large file that is many thousands of sequential network round trips, and on one real import the
- * whole run died partway through — the loop was averaging over a second a row, so a big file needed
- * well over an hour. Nothing survives that: Cloudflare cancels a Worker's outstanding work once the
- * client disconnects, and the per-invocation subrequest cap (1,000 to internal services on the free
- * plan) is reached long before the end.
+ * On a 4,583-row file that is ~14,000 sequential network round trips, and on 2026-08-20 the full
+ * import died after 583 rows and 12m35s — the loop was averaging 1.3 seconds a row, so the file
+ * needed about 100 minutes. Nothing survives that: Cloudflare cancels a Worker's outstanding work
+ * once the client disconnects, and the per-invocation subrequest cap (1,000 to internal services on
+ * the free plan) is reached long before the end.
  *
  * WHAT IS PRESERVED, because it is the whole point of REL-018. The index is built at the start of
  * the COMMIT request, not when the preview rendered, so it still sees rows written moments earlier by
- * an interrupted run of this very import — which is the exact failure that created duplicates in an
- * earlier incident. And `add()` is called for every accepted row, so a row that duplicates an earlier
- * row *in the same file* is still caught; the per-row query got that for free by reading the database
- * it had just written to, and dropping it would have quietly reintroduced within-file duplicates.
+ * an interrupted run of this very import — which is the exact failure that created 88 duplicates on
+ * 2026-07-30. And `add()` is called for every accepted row, so a row that duplicates an earlier row
+ * *in the same file* is still caught; the per-row query got that for free by reading the database it
+ * had just written to, and dropping it would have quietly reintroduced within-file duplicates.
  *
  * The matching rules are byte-for-byte the old SQL: either email colliding with either email column
  * on any existing contact, or lower(full_name) plus the same organization (NULL org treated as -1).
@@ -572,8 +571,8 @@ async function loadDupIndex(db: D1Db): Promise<DupIndex> {
 
 /**
  * Organization name → id for every organization, loaded in one query (REL-030). Replaces the three
- * queries per previously-unseen organization the commit loop used to run — a file with hundreds of new
- * organizations meant that many round trips on their own.
+ * queries per previously-unseen organization the commit loop used to run — 275 new organizations in
+ * the 2026-08-20 file, so 825 round trips on their own.
  */
 async function loadOrgIndex(db: D1Db): Promise<Map<string, number>> {
   const { results } = await db
@@ -585,8 +584,8 @@ async function loadOrgIndex(db: D1Db): Promise<Map<string, number>> {
 /**
  * How many statements go into one D1 batch. A batch is a single subrequest AND a single SQLite
  * transaction, so this trades round trips against blast radius: if one statement fails, D1 rolls the
- * whole batch back. 50 keeps even a large file to well under a hundred batches — well inside any cap
- * and a few seconds of wall clock — while keeping the fallback below cheap when a batch does fail.
+ * whole batch back. 50 keeps a 4,583-row file to ~92 batches — well inside any cap and a few seconds
+ * of wall clock — while keeping the fallback below cheap when a batch does fail.
  */
 const INSERT_BATCH = 50;
 
@@ -630,7 +629,7 @@ app.post("/import/preview", async (c) => {
   const grid = parseCsv(text);
   if (grid.length < 2)
     return c.html(
-      layout({
+      layout({ c,
         title: "Import Contacts",
         body: `<main><div class="flash warn">That file has no data rows.</div><p><a href="/import">Try another file</a></p></main>`,
       })
@@ -656,7 +655,7 @@ app.post("/import/preview", async (c) => {
       const blocked = r.errors.length > 0;
       /*
        * REL-032: a disposition code on a new row is treated like a detected duplicate — unticked and
-       * tinted, not disabled. The row is importable if the reviewer ticks it, because a genuinely new
+       * tinted, not disabled. The row is importable if the owner ticks it, because a genuinely new
        * finished-with contact must not be permanently unimportable; it just should not slip in by
        * default. The reason is already in r.flags and prints in the Notes column.
        */
@@ -696,7 +695,7 @@ app.post("/import/preview", async (c) => {
     .join("");
 
   return c.html(
-    layout({
+    layout({ c,
       title: "Import Preview",
       body: `<main>
   <h1>Import Preview</h1>
@@ -772,9 +771,8 @@ app.post("/import/commit", async (c) => {
 
   /*
    * REL-030, 2026-08-20. Three phases, each costing a handful of round trips instead of a few per
-   * row. A large file that used to fail goes from many thousands of sequential queries and well over
-   * an hour to well under a hundred queries and a few seconds. See loadDupIndex() for what this had
-   * to preserve.
+   * row. The 4,583-row file that failed goes from ~14,000 sequential queries and ~100 minutes to
+   * under 100 queries and a few seconds. See loadDupIndex() for what this had to preserve.
    */
 
   // Phase 1 — every organization, in one query. New ones inserted in batches, then re-read once so
@@ -851,7 +849,7 @@ app.post("/import/commit", async (c) => {
      VALUES (?,?,?,?,?,?,?,?)`
   )
     .bind(
-      ACTOR,
+      actor(),
       "contact",
       "batch",
       "import",
@@ -867,7 +865,7 @@ app.post("/import/commit", async (c) => {
     .run();
 
   return c.html(
-    layout({
+    layout({ c,
       title: "Import Complete",
       body: `<main>
   <div class="flash ok"><b>${created} contact${created === 1 ? "" : "s"} imported</b> from ${esc(filename)}${

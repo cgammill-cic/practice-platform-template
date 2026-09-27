@@ -1,0 +1,31 @@
+-- 0029 — Priority contact flag (the owner, 2026-09-23).
+--
+-- The owner reviewed his network against Mark McIntosh's "Known. Remembered. Chosen." and picked an inner
+-- circle of about 70 people: the connectors who have already sourced pursuits, the ecosystem partners
+-- (consultants, HR-tech alliances, search, CPA/wealth/VC) who see the problem before he does, and the
+-- ICP buyers. He wants to find that group in one search and have them lead every dashboard work list.
+--
+-- WHY A FLAG AND NOT A STAGE. His first idea was a "Priority Contacts" stage, and he rejected it himself:
+-- "I still need to be able to know if I need to chase them down, owe a follow up, etc." Stage answers
+-- "what is the next move?" — awaiting_response, follow_up_action, meeting_scheduled all drive a list of
+-- their own. Priority answers a different question, "is this someone I invest in?", and a priority contact in
+-- Follow-Up Action has to be both at once. One column cannot hold two independent facts.
+--
+-- WHY NOT priority_tier. The 1–5 tier already exists and several lists sort by it, but it was set by the
+-- 2026-08 import largely from job title (every CEO landed in tier 1), so it says "how senior", not "who
+-- I have chosen". Overloading it would erase the import's ranking for 4,500 contacts to express a choice
+-- about 70. The name is_priority and the label "★ Priority" are kept visibly different from "Tier N".
+--
+-- INTEGER NOT NULL DEFAULT 0 for the same reasons as 0011: a constant default needs no table rebuild,
+-- and the default states nothing — no contact is priority until a person says so.
+--
+-- No index. About 4,600 rows, and the flag is only ever read alongside status and stage predicates that
+-- already narrow the scan; an index here would be speed nobody measured (same reasoning as 0015).
+--
+-- No backfill. The initial 70 are a decision, not a derivation from existing columns, so they are
+-- applied as audited data changes after deploy rather than hardcoded here.
+--
+-- Rollback: ALTER TABLE contact DROP COLUMN is_priority;
+--   Loses which contacts were flagged; every change writes an audit_event, so the set is reconstructable.
+
+ALTER TABLE contact ADD COLUMN is_priority INTEGER NOT NULL DEFAULT 0;

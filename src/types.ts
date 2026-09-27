@@ -31,9 +31,9 @@ export interface D1Db {
   prepare(query: string): D1Stmt;
   /**
    * Sends many statements in ONE round trip, which is also ONE Cloudflare subrequest and ONE SQLite
-   * transaction — if any statement fails, D1 rolls the whole list back. Added (REL-030) after a large
-   * import died: at three-to-four awaited queries per row, a big enough file needs enough minutes and
-   * enough subrequests to run past Cloudflare's per-request subrequest limit.
+   * transaction — if any statement fails, D1 rolls the whole list back. Added 2026-08-20 (REL-030)
+   * after the 4,583-row import died: at three-to-four awaited queries per row it needed ~100 minutes
+   * and ~14,000 subrequests, and both of those are over the line.
    *
    * The return value is deliberately not modelled beyond the result rows. Callers here use batch()
    * for writes and never read per-statement metadata out of it; modelling more would invite reliance
@@ -42,8 +42,8 @@ export interface D1Db {
   batch<T = Record<string, unknown>>(statements: D1Stmt[]): Promise<D1Result<T>[]>;
 }
 export interface R2Bucket {
-  put(key: string, value: string): Promise<unknown>;
-  get(key: string): Promise<{ text(): Promise<string> } | null>;
+  put(key: string, value: string | Uint8Array, options?: { httpMetadata?: { contentType?: string } }): Promise<unknown>;
+  get(key: string): Promise<{ text(): Promise<string>; arrayBuffer(): Promise<ArrayBuffer> } | null>;
   delete(key: string): Promise<void>;
   list(options?: { prefix?: string }): Promise<{ objects: { key: string; uploaded: Date }[] }>;
 }
@@ -53,17 +53,11 @@ export type Bindings = {
   BACKUPS: R2Bucket;
   APP_PASSWORD: string;
   SESSION_SECRET: string;
-  /**
-   * Optional. Your deployment's own URL (e.g. `https://your-worker.your-subdomain.workers.dev`, or a
-   * custom domain), used only to build clickable links in the daily digest email. Without it the digest
-   * still sends, just without a dashboard link — see `appOrigin()` in digest.ts.
-   */
-  APP_URL?: string;
   /*
-   * Microsoft Graph. All OPTIONAL, and that is the point: a deployment with none of them set must still
-   * run, with the Outlook panel on /health saying it is not configured rather than the app failing to
-   * boot — every independent deployment of this app should work fine before anyone has registered
-   * anything with Microsoft.
+   * Microsoft Graph (M365-001, migration 0016). All OPTIONAL, and that is the point: a deployment with none
+   * of them set must still run, with the Outlook panel on /health saying it is not configured rather than
+   * the app failing to boot. That matters for PKG-001 too — another advisor's instance should work fine
+   * before they have registered anything with Microsoft.
    */
   MS_CLIENT_ID?: string;
   MS_TENANT_ID?: string;
@@ -72,12 +66,21 @@ export type Bindings = {
   MS_AUTH_BASE?: string;
   MS_GRAPH_BASE?: string;
   /**
-   * Timezone to read the calendar in when Graph will not say what the mailbox uses. Optional; defaults
-   * to Central Standard Time. A **Windows** zone id, not IANA, because that is what
-   * `/me/mailboxSettings` returns and both values feed the same `Prefer: outlook.timezone` header. Set
-   * this to your own timezone if you're not in US Central.
+   * Timezone to read the calendar in when Graph will not say what the mailbox uses. Optional; defaults to
+   * Central Standard Time (the owner's, confirmed against Outlook 2026-08-13). A **Windows** zone id, not
+   * IANA, because that is what `/me/mailboxSettings` returns and both values feed the same
+   * `Prefer: outlook.timezone` header. Set this in a distributed copy rather than editing the constant
+   * (PKG-001).
    */
   MS_TIMEZONE?: string;
+  /*
+   * Outreach drafting (Phase 2a, migration 0032). OPTIONAL like the Microsoft ones: with no key the
+   * Outreach page explains how to set it up and the draft buttons don't appear; nothing else changes.
+   * OUTREACH_MODEL overrides the default model; ANTHROPIC_BASE_URL is test-only (a local stub).
+   */
+  ANTHROPIC_API_KEY?: string;
+  OUTREACH_MODEL?: string;
+  ANTHROPIC_BASE_URL?: string;
 };
 
 /*
@@ -91,10 +94,10 @@ export type Bindings = {
  * of it threw a 500 in production, silently, until someone clicked the button.
  *
  * The spreadsheet's Priority codes are no longer carried here (#29, 2026-08-03). They rode along as
- * hints — "was code 1", "— was GHST" — to make the REL-001 import checkable: confirming the imported
- * contacts landed in the right stage is far easier with the old code on screen. That was a deliberate
- * deferral, not an oversight; the operator has now confirmed the verification pass is done, which is the trigger
- * the issue named, so the reason to keep them has expired.
+ * hints — "was code 1", "— was GHST" — to make the REL-001 import checkable: confirming 286 contacts
+ * landed in the right stage is far easier with the old code on screen. That was a deliberate deferral,
+ * not an oversight; the owner has now confirmed the verification pass is done, which is the trigger the
+ * issue named, so the reason to keep them has expired.
  *
  * What came out is the code reference, NOT the whole third element — the issue's "drop the third
  * element from each entry" would have deleted seven real explanations along with it. "gave up after no
@@ -112,14 +115,14 @@ export type Bindings = {
  * migration 0001 and the decision log. Corrected here 2026-08-04: a comment that tells the next reader
  * a file is missing, when it is sitting in docs/, is worse than no comment at all.
  *
- * pray was added 2026-08-04 by request — "I may not use it much, but I want to have it". It
+ * pray was added 2026-08-04 at the owner's request — "I may not use it much, but I want to have it". It
  * is the one outcome code in the spreadsheet's Priority column (CMPL, GHST, RTRD, Pray, NA) that never
  * got a stage. It is ACTIVE, not terminal, which is the load-bearing part: a stage in neither
  * ACTIVE_STAGES nor TERMINAL_STAGES appears in NO dashboard section, so a Pray contact with no
  * follow-up date would be invisible. Active means Needs Attention catches it instead. The hint was left
  * blank when the stage was added, because every other hint describes what the stage means and that
- * description was the operator's to write rather than the maintainer's to invent. Their own words,
- * 2026-08-04: "keep them in your prayers".
+ * description was the owner's to write rather than mine to invent. His words, 2026-08-04: "keep them in
+ * your prayers".
  *
  * follow_up_action has NO spreadsheet ancestor — it was added 2026-07-31 because the vocabulary could
  * not express "they replied, or we met, and the next move is mine". awaiting_response means they owe
@@ -165,7 +168,7 @@ export const ACTIVE_STAGES = [
 /**
  * Stages that legitimately have no next step. A contact here is finished with, not neglected.
  *
- * Exported because the dashboard's follow-up lists must exclude them (#14, confirmed
+ * Exported because the dashboard's follow-up lists must exclude them (#14, confirmed by the owner
  * 2026-08-01: "I've marked them complete with no follow up, I don't need to be reminded"). Before
  * that filter, 59 imported contacts in Complete and No Response carried a past date in
  * next_follow_up and made up roughly three quarters of the Overdue list, burying the four items that
@@ -180,6 +183,32 @@ export const ACTIVE_STAGES = [
  * is the four literals, so a check against a free-form string needs a widening cast at the use site.
  */
 export const TERMINAL_STAGES = ["complete", "no_response", "retired", "not_qualified"] as const;
+
+/**
+ * The ORDER BY key that puts priority contacts (migration 0029) first in a work list. Shared so every
+ * list says it the same way; prepend it, never replace the list's own ordering with it.
+ */
+export const PRIORITY_FIRST_ORDER = "c.is_priority DESC";
+
+/**
+ * The Touch Every cadence a contact gets when first flagged ★ Priority with no cadence of its own
+ * (the owner, 2026-09-25: "set the cadence at 42 days for whenever someone becomes a priority contact").
+ * 42 days is the connector tier from the priority-circle rebalance. It fills an EMPTY cadence only: an
+ * interval already set, or one typed on the same save, is never overwritten.
+ */
+export const PRIORITY_DEFAULT_CADENCE = 42;
+
+/**
+ * Sorts contact.meeting_time as a time of day (2026-09-25). meeting_time is free text ("9:00 am",
+ * "2:30 pm", "10am"), so ORDER BY meeting_time sorted it alphabetically and put "2:00 pm" before
+ * "9:00 am", in both the dashboard's meeting lists and the digest. This reads the leading hour, the
+ * minutes after a colon if there is one, and am/pm, into minutes since midnight. A blank or unreadable
+ * time sorts last. Assumes the `c` alias.
+ */
+export const MEETING_TIME_ORDER = `(CASE WHEN ifnull(c.meeting_time,'') = '' OR trim(c.meeting_time) NOT GLOB '[0-9]*' THEN 9999 ELSE
+  ((CAST(c.meeting_time AS INTEGER) % 12) + CASE WHEN lower(c.meeting_time) LIKE '%pm%' THEN 12 ELSE 0 END) * 60
+  + CASE WHEN instr(c.meeting_time, ':') > 0 THEN CAST(substr(c.meeting_time, instr(c.meeting_time, ':') + 1, 2) AS INTEGER) ELSE 0 END
+END)`;
 
 export const STRENGTHS = [
   ["strong", "Strong"],
@@ -237,7 +266,7 @@ export const MAX_TOUCH_INTERVAL_DAYS = 1095;
 /**
  * Departments. Values equal labels because these are stored as written and read back in reports.
  *
- * Sales, Marketing, Supply Chain and Legal/Compliance were added 2026-07-30 by request,
+ * Sales, Marketing, Supply Chain and Legal/Compliance were added 2026-07-30 at the owner's request,
  * after the REL-001 analysis found 10 priority contacts sitting in those functions and about to be
  * flattened into "Other". Operations and Delivery already existed. "Delivery/Consulting" in the
  * source spreadsheet still maps to Delivery — that is a naming variant, not a separate function.
@@ -266,7 +295,7 @@ export const STATUSES = [
  * Activity categories for time entry (TIME-001, #90) — DATA, NOT A CONSTANT, since migration 0026.
  *
  * This used to be a hardcoded list here, mirrored by a CHECK constraint on time_entry.activity that
- * needed its own migration every time a category was added. Asked, 2026-09-09: "Can I have the
+ * needed its own migration every time a category was added. The owner, 2026-09-09: "Can I have the
  * application create a new category when I've added it to Outlook, but ask me how to apply it in the
  * app?" — the honest answer was no, so the vocabulary moved into a real `activity` table instead. See
  * migration 0026 for the full argument and src/activities.ts for the loader (`loadActivities`) and the
@@ -280,7 +309,7 @@ export const STATUSES = [
  */
 
 /**
- * The activity that pays the bills, and the reason the import has to be right (2026-08-11:
+ * The activity that pays the bills, and the reason the import has to be right (the owner, 2026-08-11:
  * "The BIGGEST thing I will need is the 'Client Delivery' time captured because i will use that for
  * invoicing").
  *
@@ -298,16 +327,25 @@ export const STATUSES = [
 export const BILLABLE_ACTIVITY = "Client Delivery";
 
 /**
+ * The activity that answers "how much time have I spent selling this specific client" (2026-09-16,
+ * The owner: "Pursuit/Proposal + customer name... would be the sales category and Client Delivery +
+ * customer name would be billable work"). Same fixed-constant treatment as BILLABLE_ACTIVITY above and
+ * for the same reason — this is the one other activity the per-customer report singles out by name,
+ * not a general "anything non-billable" bucket.
+ */
+export const SALES_ACTIVITY = "Pursuit/Proposal";
+
+/**
  * How an engagement is billed (CUST-001, #91). These values carry a CHECK constraint on
  * engagement.billing_method — from migration 0001, widened by 0022 — so the list cannot be extended
  * without a table rebuild. The column is NOT NULL, which is why the engagement form makes it a required
  * choice rather than offering a blank.
  *
- * Decided 2026-07-29: all the models are in real use in the practice, varying by client, so billing
- * method is a property of the engagement and never a firm-wide setting.
+ * Decided 2026-07-29: all the models are in real use at CiC, varying by client, so billing method is a
+ * property of the engagement and never a firm-wide setting.
  *
- * `tm_not_to_exceed` added 2026-09-02 — a real engagement was billed that way and the schema rejected it,
- * which is the failure REL-022 exists to catch. `undecided` added in the same migration for a reason worth
+ * `tm_not_to_exceed` added 2026-09-02 at the owner's naming — he bills it and the schema rejected it, which
+ * is the failure REL-022 exists to catch. `undecided` added in the same migration for a reason worth
  * stating: a pursuit at `identified` has no billing method yet, and forcing the choice on the create form
  * means whatever gets picked to get past the field is then wrong in every pipeline report. "Not decided
  * yet" is a fact about the deal, not a missing value.
@@ -371,12 +409,12 @@ export const isLive = (s: string) => (LIVE_STAGES as readonly string[]).includes
 export const isDead = (s: string) => (DEAD_STAGES as readonly string[]).includes(s);
 
 /**
- * What kind of work it is (PURS-001). "I would like to know what type of work it would be…so
+ * What kind of work it is (PURS-001). The owner: "I would like to know what type of work it would be…so
  * that I can ultimately track what work is in most demand."
  *
  * A CONTROLLED LIST IS THE WHOLE POINT, and the four rows already in the table prove why. `service_type`
- * was free text, and one client's *Organizational Design* engagement was filed under `Executive Support` —
- * so a demand report run the day before this shipped would have shown zero demand for org design. On four
+ * was free text, and Datum's *Organizational Design* engagement was filed under `Executive Support` — so
+ * a demand report run the day before this shipped would have shown zero demand for org design. On four
  * rows that is a curiosity; on forty it is a wrong answer to the question the field exists to answer.
  *
  * Values equal labels, the convention DEPARTMENTS uses (and the activity table now uses via its `name`
@@ -402,9 +440,8 @@ export const SERVICE_TYPES = [
 ] as const;
 
 /**
- * Who a contact is on a pursuit (`engagement_contact.role`). The decision maker and the
- * influencers were the original ask; the rest of this list is the shape those two actually take in a
- * real deal.
+ * Who a contact is on a pursuit (`engagement_contact.role`). The owner asked for the decision maker and the
+ * influencers; the rest of this list is the shape those two actually take in a real deal.
  *
  * `economic_buyer` is separate from `decision_maker` because they are frequently different people, and
  * confusing them is the classic reason a pursuit dies late — the sponsor says yes and the person holding
@@ -553,7 +590,7 @@ export const ORG_RELATIONSHIP = [
 /**
  * An organization (migration 0001). Editable for the first time in ORG-001 — until 2026-09-02 nothing in
  * the app could write `domain`, `industry`, `address`, `relationship_status` or `notes`, and all five were
- * empty on every organization row. They were not unused because they were unwanted; there was simply
+ * empty on every one of the 2,120 rows. They were not unused because they were unwanted; there was simply
  * no screen. Organizations are still created name-only by adding a contact, by the engagement form and by
  * the importer, which is why the edit screen matters more than the create one.
  */
@@ -562,7 +599,7 @@ export interface Organization {
   name: string;
   domain: string | null;
   industry: string | null;
-  /** The operator's "physical address" for pursuit and invoicing context. Lives here, not on the pursuit. */
+  /** the owner's "physical address" for pursuit and invoicing context. Lives here, not on the pursuit. */
   address: string | null;
   relationship_status: string | null;
   notes: string | null;
@@ -583,9 +620,9 @@ export interface TimeEntry {
   contact_id: number | null;
   contact_name?: string | null;
   /**
-   * The operator's own words — the Comments field. Free text, and NEVER written by the calendar import
-   * (see migration 0017). A re-import updates hours, activity and customer on a row it created and leaves
-   * this alone, so a sentence typed here survives every subsequent import of the same week.
+   * The owner's own words — the Comments field. Free text, and NEVER written by the calendar import (see
+   * migration 0017). A re-import updates hours, activity and customer on a row it created and leaves this
+   * alone, so a sentence typed here survives every subsequent import of the same week.
    */
   note: string | null;
   /**
@@ -597,8 +634,8 @@ export interface TimeEntry {
    * 1 when this imported row has been corrected by hand and now contradicts Outlook (migration 0019). The
    * import leaves such a row alone and flags it, so re-importing a week never silently reverts a fix to
    * hours that may be on an invoice. Set only by a change to date/hours/activity/customer — editing the
-   * comment does not count, because comments are already safe from re-import. Cleared only when the
-   * operator explicitly ticks the flagged row, which hands it back to the calendar.
+   * comment does not count, because comments are already safe from re-import. Cleared only when the owner
+   * explicitly ticks the flagged row, which hands it back to the calendar.
    */
   hand_edited: number;
   source: string;
@@ -652,6 +689,13 @@ export interface Contact {
    * through a converting layer. Truthiness is the test everywhere it is used.
    */
   no_linkedin: number;
+  /**
+   * Priority contact: one of the ~70-person inner circle the owner chose to invest in (migration 0029).
+   * Deliberately NOT a stage — a priority contact still needs its stage to say whether he chases or owes
+   * them — and NOT priority_tier, which is the import's seniority ranking. Work lists sort flagged
+   * contacts first, within each list's own ordering. Stored as a number like no_linkedin.
+   */
+  is_priority: number;
   birthday: string | null;
   stage: string;
   strength: string | null;
@@ -679,6 +723,13 @@ export interface Contact {
   meeting_date: string | null;
   /** Optional free-text time, e.g. "10:30 am" (migration 0004). */
   meeting_time: string | null;
+  /**
+   * The Outlook event that set this meeting (migration 0030), or null when typed by hand. The hourly
+   * calendar sync (meetingsync.ts) only follows reschedules for meetings it set.
+   */
+  meeting_event_id?: string | null;
+  /** The last synced event he resolved or erased, so the sync never re-adds it (migration 0030). */
+  meeting_event_dismissed?: string | null;
   notes: string | null;
   source: string | null;
   status: string;

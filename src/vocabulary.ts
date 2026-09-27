@@ -3,8 +3,8 @@
  *
  * Why this exists: on 2026-07-31, REL-020 (#40) added follow_up_action to STAGES in types.ts without a
  * migration adding it to the contact.stage CHECK constraint. Every write of the new value was rejected
- * by SQLite and surfaced as an Internal Server Error. Nothing in the system noticed. The operator found
- * it by clicking a button, which is the wrong way to learn that a deploy is broken.
+ * by SQLite and surfaced as an Internal Server Error. Nothing in the system noticed. The owner found it
+ * by clicking a button, which is the wrong way to learn that a deploy is broken.
  *
  * Two directions of drift matter, and they fail differently:
  *
@@ -16,12 +16,12 @@
  *
  * Both are checked here, on /health and as a dashboard banner, so a mismatch announces itself.
  *
- * GENERALISED to any (table, column) pair carrying a CHECK constraint, and immediately used for a second
- * one: time_entry.activity. That was not a speculative refactor — the day migration 0012 added the
- * activity constraint, a live Outlook calendar was found to be using `Business Development` where the
- * agreed standard said `Business development`, which is this exact class of mismatch in a new column.
- * Migration 0013 fixed the values; this makes the column self-checking, so the next disagreement
- * announces itself here instead of surfacing as a failed save.
+ * GENERALISED 2026-08-11 to any (table, column) pair carrying a CHECK constraint, and immediately used
+ * for a second one: time_entry.activity. That was not a speculative refactor — the day migration 0012
+ * added the activity constraint, the owner's live Outlook calendar was found to be using
+ * `Business Development` where the agreed standard said `Business development`, which is this exact class
+ * of mismatch in a new column. Migration 0013 fixed the values; this makes the column self-checking, so
+ * the next disagreement announces itself here instead of surfacing as a failed save.
  */
 
 import { STAGES, type D1Db } from "./types";

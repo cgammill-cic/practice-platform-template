@@ -1,12 +1,12 @@
 /*
  * TIME-001 — where the week went (#90).
  *
- * The recurring ask this answers: knowing, each week, the hours worked on specific activities — not
- * just that time was spent, but on what.
+ * The owner, 2026-08-11: "I would still like to know each week the hours I've worked on specific
+ * activities." Raised above the user-accounts work in the same conversation.
  *
  * MANUAL ENTRY IS NOT A STOPGAP FOR THE CALENDAR IMPORT, and the distinction matters for how this is
- * built. The Outlook categories are standardised to make a calendar-to-timesheet workflow possible
- * (definitions.md §5a), and that needs Microsoft Graph (M365-001). But a calendar is only ever
+ * built. The Outlook categories were standardised in July 2026 to make a calendar-to-timesheet workflow
+ * possible (definitions.md §5a), and that needs Microsoft Graph (M365-001). But a calendar is only ever
  * a claim about where the time went: meetings run over, get cancelled without being deleted, and whole
  * afternoons of deep work never appear on it at all. So typing hours in stays the source of truth you can
  * correct, and the import — when it lands — writes into this same table with source='calendar' beside
@@ -15,8 +15,8 @@
  * WHAT THIS DELIBERATELY DOES NOT DO. No billing, no invoicing, no rate arithmetic. `engagement` carries
  * billing_method and three rate fields, so the join exists the moment it is wanted, but "what should I
  * invoice" is a different question from "where did my week go" and answering both at once would mean
- * deciding what counts as billable before the operator has said so. Hours are recorded against an
- * engagement; money stays in QuickBooks.
+ * deciding what counts as billable before the owner has said. Hours are recorded against an engagement;
+ * money stays in QuickBooks.
  *
  * PERSONAL IS SHOWN BELOW THE LINE, NOT EXCLUDED. It is one of the ten Outlook categories, so it can be
  * logged — but it is not hours worked, and adding it to the worked total would overstate every week. The
@@ -29,11 +29,11 @@ import { Hono } from "hono";
 import { activityOptions, isKnownActivity, loadActivities, nonWorkNames, type ActivityRow } from "./activities";
 import { pickableEngagements } from "./engagements";
 import { esc, layout, select } from "./views";
-import { BILLABLE_ACTIVITY, type Bindings, type D1Db, type TimeEntry } from "./types";
+import { BILLABLE_ACTIVITY, SALES_ACTIVITY, type Bindings, type D1Db, type TimeEntry } from "./types";
 import { isPeriod, PERIODS, periodBounds, shiftPeriod, shiftWeek, weekBounds, type Period } from "./weeks";
+import { actor } from "./auth";
 
 const app = new Hono<{ Bindings: Bindings }>();
-const ACTOR = "operator";
 const today = () => new Date().toISOString().slice(0, 10);
 
 /** "Fri" for 2026-08-14. Parsed as UTC so a date string never drifts a day by the server's zone. */
@@ -79,7 +79,7 @@ async function audit(db: D1Db, id: number, action: string, after: string, before
     .prepare(
       "INSERT INTO audit_event (actor, entity, entity_id, action, before_summary, after_summary, source, correlation_id) VALUES (?,'time_entry',?,?,?,?,'app',?)"
     )
-    .bind(ACTOR, String(id), action, before ?? null, after, `time-${id}`)
+    .bind(actor(), String(id), action, before ?? null, after, `time-${id}`)
     .run();
 }
 
@@ -114,14 +114,20 @@ async function totalsByActivity(db: D1Db, start: string, end: string) {
 /*
  * Hours per customer, SPLIT INTO BILLABLE AND NOT.
  *
- * The split is the whole point of this query, and it was not in the first version. The billable activity
- * — the one used for invoicing — has to be visible on its own. A single per-customer total silently
- * conflates two different things — the delivery you bill for, and the business development, travel and
- * admin that happen to be attached to the same engagement.
+ * The split is the whole point of this query, and it was not in the first version. The owner, 2026-08-11:
+ * "The BIGGEST thing I will need is the 'Client Delivery' time captured because i will use that for
+ * invoicing." A single per-customer total silently conflates two different things — the delivery you bill
+ * for, and the business development, travel and admin that happen to be attached to the same engagement.
  * Reading a combined total as an invoice line would overbill, which is the one error in this app that
  * reaches somebody else's money.
  *
  * So both numbers travel, ordered by the billable one, and the report labels which is which.
+ *
+ * A third number joined them 2026-09-16: sales_hours, the same split applied to SALES_ACTIVITY
+ * ("Pursuit/Proposal") instead of BILLABLE_ACTIVITY. The owner's ask was specifically to see how much time
+ * he's spent SELLING a given client alongside how much he's spent DELIVERING for them — the same
+ * per-customer conflation problem the billable/all-hours split above already exists to solve, just for
+ * the other number that matters here.
  */
 async function totalsByCustomer(db: D1Db, start: string, end: string) {
   const { results } = await db
@@ -129,14 +135,15 @@ async function totalsByCustomer(db: D1Db, start: string, end: string) {
       `SELECT e.id AS engagement_id, e.name AS engagement_name, e.qb_customer_id,
               o.name AS organization_name,
               ROUND(SUM(t.hours), 2) AS hours,
-              ROUND(SUM(CASE WHEN t.activity = ? THEN t.hours ELSE 0 END), 2) AS billable_hours
+              ROUND(SUM(CASE WHEN t.activity = ? THEN t.hours ELSE 0 END), 2) AS billable_hours,
+              ROUND(SUM(CASE WHEN t.activity = ? THEN t.hours ELSE 0 END), 2) AS sales_hours
          FROM time_entry t
          LEFT JOIN engagement e ON e.id = t.engagement_id
          LEFT JOIN organization o ON o.id = e.organization_id
         WHERE t.date >= ? AND t.date <= ?
         GROUP BY t.engagement_id ORDER BY billable_hours DESC, hours DESC`
     )
-    .bind(BILLABLE_ACTIVITY, start, end)
+    .bind(BILLABLE_ACTIVITY, SALES_ACTIVITY, start, end)
     .all<{
       engagement_id: number | null;
       engagement_name: string | null;
@@ -144,6 +151,7 @@ async function totalsByCustomer(db: D1Db, start: string, end: string) {
       organization_name: string | null;
       hours: number;
       billable_hours: number;
+      sales_hours: number;
     }>();
   return results;
 }
@@ -342,8 +350,8 @@ app.get("/time", async (c) => {
                 }${
                   /* Subject first — it says what the block WAS. The comment sits under it in the same
                      grey, prefixed, so on an imported row it is visible which line came from Outlook and
-                     which line is the operator's own. On a hand-typed row there is no subject and the
-                     comment is the only line, so the prefix would be noise; it is dropped in that case. */ ""
+                     which line is the owner's. On a hand-typed row there is no subject and the comment is
+                     the only line, so the prefix would be noise; it is dropped in that case. */ ""
                 }${
                   r.hand_edited
                     ? ' <span class="pill grey">corrected — import will not overwrite</span>'
@@ -364,7 +372,7 @@ app.get("/time", async (c) => {
     .join("");
 
   return c.html(
-    layout({
+    layout({ c,
       title: "Time",
       body: `<main>
   ${FLASH[c.req.query("flash") ?? ""] ?? ""}
@@ -378,9 +386,15 @@ app.get("/time", async (c) => {
   }
   <h1>Time</h1>
   ${weekNav("/time", anchor, start, end)}
-  <p class="sub"><b>${esc(fmt(worked))} hours worked</b>${
+  <p class="meta" style="margin:0 0 4px"><b>${esc(fmt(worked))} hours worked</b>${
         personal ? ` · ${esc(fmt(personal))} not worked (personal, vacation, etc.), not counted` : ""
-      } · <a href="/time/report?week=${esc(anchor)}">weekly report</a> · <a href="/time/import?week=${esc(anchor)}">import from Outlook</a> · <a href="/engagements">customers</a> · <a href="/">dashboard</a></p>
+      }</p>
+  <div class="linkbar">
+    <a class="linkchip" href="/time/report?week=${esc(anchor)}">Weekly Report</a>
+    <a class="linkchip" href="/time/import?week=${esc(anchor)}">Import from Outlook</a>
+    <a class="linkchip" href="/engagements">Customers</a>
+    <a class="linkchip" href="/">Dashboard</a>
+  </div>
   ${entryForm(engagements, today() >= start && today() <= end ? today() : start, anchor, activityOptions(activityRows))}
   <table><tbody>${list}</tbody></table>
   <p class="meta" style="margin-top:8px">Weeks run Sunday–Saturday, the same as the dashboard. Non-work time (Personal, Vacation/Holiday, and any other activity marked that way) is logged if you log it, and is never included in hours worked.${
@@ -469,7 +483,7 @@ app.get("/time/:id/edit", async (c) => {
   const engagements = await pickableEngagements(c.env.DB);
   const activityRows = await loadActivities(c.env.DB);
   return c.html(
-    layout({
+    layout({ c,
       title: "Edit Time Entry",
       body: `<main>
   <h1>Edit Time Entry</h1>
@@ -540,7 +554,7 @@ app.post("/time/:id/edit", async (c) => {
    * disagree about this row", not "a human touched this row".
    *
    * Only ever set, never cleared here, and only on rows the import created. A hand-typed row was never at
-   * risk. Clearing is the import's job, and only when the operator explicitly ticks the flagged row.
+   * risk. Clearing is the import's job, and only when the owner explicitly ticks the flagged row.
    */
   const contradictsCalendar =
     before.source === "calendar" &&
@@ -677,11 +691,15 @@ app.get("/time/report", async (c) => {
       <td class="num" data-label="Client Delivery">${
         r.billable_hours ? `<b>${esc(fmt(r.billable_hours))}</b>` : '<span class="meta">—</span>'
       }</td>
+      <td class="num" data-label="Pursuit/Proposal">${
+        r.sales_hours ? esc(fmt(r.sales_hours)) : '<span class="meta">—</span>'
+      }</td>
       <td class="num" data-label="All hours"><span class="meta">${esc(fmt(r.hours))}</span></td>
     </tr>`
     )
     .join("");
   const billableTotal = byCustomer.reduce((n, r) => n + r.billable_hours, 0);
+  const salesTotal = byCustomer.reduce((n, r) => n + r.sales_hours, 0);
 
   /*
    * LINE BY LINE, FOR THE INVOICE.
@@ -725,12 +743,16 @@ app.get("/time/report", async (c) => {
     .join("");
 
   return c.html(
-    layout({
+    layout({ c,
       title: "Weekly Hours",
       body: `<main>
   <h1>Weekly Hours</h1>
   ${periodNav("/time/report", period, anchor, label, customerId ? `&customer=${customerId}` : "")}
-  <p class="sub"><a href="/time?week=${esc(anchor)}">log or edit time</a> · <a href="/engagements">customers</a> · <a href="/">dashboard</a></p>
+  <div class="linkbar">
+    <a class="linkchip" href="/time?week=${esc(anchor)}">Log or Edit Time</a>
+    <a class="linkchip" href="/engagements">Customers</a>
+    <a class="linkchip" href="/">Dashboard</a>
+  </div>
 
   <section>
     <h2>Hours worked${worked ? ` — ${esc(fmt(worked))}` : ""}</h2>
@@ -754,7 +776,7 @@ app.get("/time/report", async (c) => {
   </section>
 
   <section>
-    <h2>By customer — ${esc(fmt(billableTotal))} billable</h2>
+    <h2>By customer — ${esc(fmt(billableTotal))} billable, ${esc(fmt(salesTotal))} selling</h2>
     ${
       orphanBillable
         ? `<p class="flash warn"><b>${esc(fmt(orphanBillable))} hours of ${esc(
@@ -768,10 +790,12 @@ app.get("/time/report", async (c) => {
       byCustomer.length
         ? `<table><thead><tr><th>Customer</th><th class="num">${esc(
             BILLABLE_ACTIVITY
-          )}</th><th class="num">All hours</th></tr></thead><tbody>${customerRows}</tbody></table>
+          )}</th><th class="num">${esc(SALES_ACTIVITY)}</th><th class="num">All hours</th></tr></thead><tbody>${customerRows}</tbody></table>
     <p class="meta" style="margin-top:8px"><b>The ${esc(
       BILLABLE_ACTIVITY
-    )} column is the invoicing number</b>; "All hours" is everything logged against that customer including business development, travel and admin. They are deliberately separate — reading a combined total as an invoice line would overbill, which is the one error here that reaches somebody else's money. The QuickBooks id is shown so a wrong one is visible where it matters, and <b>nothing verifies it</b>: there is no QuickBooks connection, so a mistyped id simply never reconciles and nothing else would tell you. Time with no customer is not hidden — internal work genuinely has none.</p>`
+    )} column is the invoicing number</b>; <b>${esc(
+      SALES_ACTIVITY
+    )} is what it cost to sell that client</b> — the two side by side answer both "what do I bill them" and "what did winning/keeping them cost me." "All hours" is everything logged against that customer including travel and admin too. All three are deliberately separate — reading a combined total as an invoice line would overbill, which is the one error here that reaches somebody else's money. The QuickBooks id is shown so a wrong one is visible where it matters, and <b>nothing verifies it</b>: there is no QuickBooks connection, so a mistyped id simply never reconciles and nothing else would tell you. Time with no customer is not hidden — internal work genuinely has none.</p>`
         : '<div class="empty">No hours logged for this week, so there is nothing to attribute.</div>'
     }
   </section>

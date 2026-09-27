@@ -6,10 +6,10 @@
  * None of that was readable without a database query. This is the half that makes the trail evidence
  * rather than an assertion that evidence exists.
  *
- * The motivating case is concrete. Questions came up that could only be answered by querying D1
- * directly: did the test contact's audit event record the right id, what exactly did a date cleanup
- * change, and what did a backfill write. Each was a fair question about the operator's own data that
- * they could not answer themselves without direct database access.
+ * The motivating case is concrete. On 2026-07-31 and 08-01 three questions came up that could only be
+ * answered by querying D1 directly: did the test contact's audit event record the right id, what
+ * exactly did the 59-row date cleanup change, and what did the Stay Connected backfill write. Each was
+ * a fair question about the owner's own data that he could not answer himself.
  *
  * Design decisions:
  *
@@ -71,6 +71,8 @@ function entityLink(r: AuditRow): string {
     return `interaction ${esc(r.entity_id)} <span class="meta">· <a href="/contacts/${contactFromCorrelation}/history">history</a></span>`;
   if (r.entity === "message_template" && r.entity_id && /^\d+$/.test(r.entity_id))
     return `<a href="/templates/${esc(r.entity_id)}/edit">template ${esc(r.entity_id)}</a>`;
+  if (r.entity === "commitment" && r.entity_id && /^\d+$/.test(r.entity_id))
+    return `commitment ${esc(r.entity_id)} <span class="meta">· <a href="/commitments?show=all">commitments</a></span>`;
   if (r.entity === "action_item" && contactFromCorrelation)
     return `action item ${esc(r.entity_id)} <span class="meta">· <a href="/contacts/${contactFromCorrelation}#actions">contact</a></span>`;
   return `${esc(r.entity)} ${esc(r.entity_id ?? "—")}`;
@@ -211,13 +213,17 @@ app.get("/audit", async (c) => {
     .join("");
 
   return c.html(
-    layout({
+    layout({ c,
       title: "Audit Trail",
       body: `<main>
   <h1>Audit Trail</h1>
-  <p class="sub">${total} event${total === 1 ? "" : "s"}${filtersActive ? " matching" : ""}${
+  <p class="meta" style="margin:0 0 4px">${total} event${total === 1 ? "" : "s"}${filtersActive ? " matching" : ""}${
         pages > 1 ? ` · page ${safePage} of ${pages}` : ""
-      }${filtersActive ? ` · <a href="/audit">clear filters</a>` : ""} · <a href="/">back to dashboard</a></p>
+      }</p>
+  <div class="linkbar">
+    ${filtersActive ? '<a class="linkchip" href="/audit">Clear Filters</a>' : ""}
+    <a class="linkchip" href="/">Back to Dashboard</a>
+  </div>
 
   ${contactNote ? `<div class="flash ${contactNote.startsWith("No contact") ? "warn" : "ok"}">${contactNote}</div>` : ""}
 

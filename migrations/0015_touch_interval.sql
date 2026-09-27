@@ -14,14 +14,14 @@
 --
 -- WHY PER-CONTACT AND NOT DERIVED FROM STRENGTH
 -- ---------------------------------------------
--- A deliberate choice over the §4 rule as written. Relationship strength is one
+-- The owner's decision, 2026-08-11, choosing this over the §4 rule as written. Relationship strength is one
 -- fact about someone; how often you want to reach out is another, and they do not always agree. A Pray
 -- contact might want weekly; a former colleague you are simply fond of might want yearly; both could be
 -- "strong". Deriving the interval would have made those two indistinguishable.
 --
--- NO BACKFILL, and this one matters. A cadence nobody chose is a commitment the app invented on the
--- operator's behalf, and it would immediately start writing follow-up dates onto 295 contacts. NULL means "no
--- cadence", which stays the state of every existing row until one is set.
+-- NO BACKFILL, and this one matters. A cadence nobody chose is a commitment the app invented on his
+-- behalf, and it would immediately start writing follow-up dates onto 295 contacts. NULL means "no
+-- cadence", which stays the state of every existing row until he sets one.
 --
 -- HOW IT APPLIES, in precedence order (contacts.ts, the interaction POST):
 --   1. a date typed on the form always wins — the field is the decision

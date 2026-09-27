@@ -3,20 +3,20 @@
  *
  * `contact.referral_source_contact_id` has existed since migration 0001 and was maintained correctly by
  * the delete path, but nothing could ever set it: there was no field on either contact form, so in
- * practice the column was always NULL for every contact. The form field lives in contacts.ts; this is
- * the view that makes the data worth entering.
+ * practice the column was always NULL. Confirmed against production 2026-08-02 — 286 contacts, 0 with a
+ * referrer. The form field lives in contacts.ts; this is the view that makes the data worth entering.
  *
- * WHY A PAGE RATHER THAN A DASHBOARD SECTION. The dashboard already has several sections and answers
- * "what do I do today"; a referral source is something you cultivate over months, and with zero
- * referrals recorded an extra section would have sat empty for weeks teaching you to scroll past it.
- * Worth revisiting as a short "top three" line once there is real data — the decision was about an empty
- * table, not about the idea.
+ * WHY A PAGE RATHER THAN A DASHBOARD SECTION. The owner's call, 2026-08-02. The dashboard already has
+ * seven sections and answers "what do I do today"; a referral source is something you cultivate over
+ * months, and with zero referrals recorded an eighth section would have sat empty for weeks teaching
+ * you to scroll past it. Worth revisiting as a short "top three" line once there is real data — the
+ * decision was about an empty table, not about the idea.
  *
- * NON-CONTACT REFERRERS ARE OUT OF SCOPE, deliberately. The column is a foreign key to another contact,
- * so someone who referred you but is not in the database cannot be recorded without a migration and a
- * second kind of source the report could never deduplicate. The answer is to add them as a contact,
- * which is arguably the right answer anyway: a referral source is a relationship, and one worth tracking
- * is one worth having a record for.
+ * NON-CONTACT REFERRERS ARE OUT OF SCOPE, deliberately (the owner, 2026-08-02). The column is a foreign
+ * key to another contact, so someone who referred you but is not in the database cannot be recorded
+ * without a migration and a second kind of source the report could never deduplicate. The answer is to
+ * add them as a contact, which is arguably the right answer anyway: a referral source is a
+ * relationship, and one worth tracking is one worth having a record for.
  */
 
 import { Hono } from "hono";
@@ -99,7 +99,7 @@ app.get("/referrals", async (c) => {
   </div>`;
 
   return c.html(
-    layout({
+    layout({ c,
       title: "Referral Sources",
       body: `<main>
   <h1>Referral Sources</h1>

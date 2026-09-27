@@ -1,21 +1,21 @@
--- 0024 — email import needs "no" as well as "yes" (2026-09-09).
+-- 0024 — email import needs "no" as well as "yes" (the owner, 2026-09-09).
 --
 -- THE PROBLEM. /email/import (MAIL-001) can log a message as an interaction, or leave it unticked — and
 -- unticked is not a decision, it is silence. The preview re-fetches the live mailbox on every visit, so
--- anything never logged reappears every single time that week is reviewed, forever. "if I don't
+-- anything never logged reappears every single time that week is reviewed, forever. The owner: "if I don't
 -- bring them in, they keep showing up on the list."
 --
 -- Two different problems share that one symptom, so this migration is two small additions, not one:
 --
 --   1. A single message needs a real "no" that sticks — not just "not yet". Table below.
 --   2. A whole PERSON can need "no" — project work with someone like a busy back-and-forth counterpart
---      produces mail every day, and none of it is worth a prompt once that's known. A column on
+--      produces mail every day, and none of it is worth a prompt once the owner knows that. A column on
 --      contact, the same shape as 0011's no_linkedin: a flag nobody defaults to a claim about, only ever
 --      set by a person clicking a button.
 --
 -- WHY A SEPARATE TABLE FOR THE EXCLUSION, NOT A ROW IN interaction. interaction is a record of a
 -- conversation that actually happened (contactList.ts's own delete-guard rationale: "conversations that
--- actually happened"). An excluded message is the opposite fact — someone looked at it and decided it is
+-- actually happened"). An excluded message is the opposite fact — the owner looked at it and decided it is
 -- NOT part of this contact's history. Writing it into interaction would corrupt the one table every
 -- report, chase-list count and attempt-ladder calculation already trusts to mean "a real touch".
 --

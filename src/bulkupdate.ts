@@ -1,9 +1,9 @@
-// Bulk field updates from a file (REL-033, 2026-08-21).
+// Bulk field updates from a file (REL-033, the owner 2026-08-21).
 //
-// THE PROBLEM. The operator curates offline. Which contacts are Retired or Not Qualified, and what
-// priority each deserves, gets decided in a spreadsheet — and there was no way to get those decisions
-// back in. The recurring request, paraphrased: "I've done updates offline to change the priority and
-// even the stage of some contacts — is there a way to bring that back into the app?"
+// THE PROBLEM. He curates offline. He decided which of 4,000+ contacts are Retired or Not Qualified,
+// and what priority each deserves, in a spreadsheet — and had no way to get those decisions back in.
+// His words: "I have done some updates offline to update the priority and even change the stage of
+// some contacts… Is that possible now or is that something that would need to be developed?"
 //
 // WHY THIS IS NOT PART OF THE IMPORTER. /import is insert-only on purpose: it matches every row
 // against current state and SKIPS what it finds, which is the guarantee that a re-run cannot damage
@@ -13,28 +13,32 @@
 // look alike, because the cost of confusing them is asymmetric: a missed insert is an absence you
 // will notice, and a wrong overwrite is a silent loss of something you curated.
 //
-// MATCHING IS BY id ONLY, chosen 2026-08-21 over name/email fallbacks. The id comes from
-// /export/contacts.csv, so an update file is always born from current state rather than a stale copy,
-// and there is no chance of a name collision writing to the wrong person — production has already
-// produced real evidence that names are not keys, more than once. The cost is that a hand-built file
-// without ids cannot be used, which is the right trade: the export is one click.
+// MATCHING IS BY id ONLY. The owner's choice 2026-08-21, offered against name/email fallbacks. The id
+// comes from /export/contacts.csv, so an update file is always born from current state rather than a
+// stale copy, and there is no chance of a name collision writing to the wrong person — the app has two
+// Brad Haudans' worth of evidence that names are not keys. The cost is that a hand-built file without
+// ids cannot be used, which is the right trade: the export is one click.
 //
-// FOUR FIELDS ARE WRITABLE: stage, priority_tier, strength, status — the middle of three options that
-// were considered. These are the judgment fields — what the operator decides ABOUT a contact. Names, employers,
+// FOUR FIELDS ARE WRITABLE: stage, priority_tier, strength, status. The owner's choice, the middle of
+// three options. These are the judgment fields — what he decides ABOUT a contact. Names, employers,
 // phones and every date are deliberately NOT writable here, so a spreadsheet autocorrect or a
 // phone number that Excel helpfully turned into a float cannot reach production through this door.
 // Identity and history change one record at a time, on the record.
 //
 // EMAIL JOINED THE LIST 2026-09-08, and it is the one exception to "identity changes one record at a
-// time" above — not a reversal of that rule, but a case the rule never actually covered. An attempt to
-// correct a batch of stale emails through /import ran into the fact that it has no update path at all: a
-// matched row is only ever SKIPPED, never written, and the changed emails could never match anything
-// (they were new values by definition), so the name+organization fallback was all that stood between
-// each row and a fresh insert. Most rows had a blank or mismatched organization column and became
-// duplicate contacts; the one row that WOULD have matched by name+org was correctly skipped and so its
-// email was never written either — /import cannot update ANY matched row, which is not a bug in the
-// matcher, it is the route's whole design. Cleaning up the resulting duplicates by hand is what surfaced
-// this gap.
+// time" above — not a reversal of that rule, but a case the rule never actually covered. He tried to
+// correct ~15 stale emails through /import, which has no update path at all: a matched row is only ever
+// SKIPPED, never written, and the changed emails could never match anything (they were new values by
+// definition), so the name+organization fallback was all that stood between each row and a fresh insert.
+// Twelve rows had a blank or mismatched organization column and became duplicate contacts; the one row
+// that WOULD have matched (one contact, by name+org) was correctly skipped and so her email
+// was never written either — /import cannot update ANY matched row, which is not a bug in the matcher,
+// it is the route's whole design. Cleaning up the twelve duplicates by hand is what surfaced this gap.
+//
+// is_priority JOINED 2026-09-23 (migration 0029). It is a judgment field in the purest sense — whether
+// a contact is in the inner circle — so it belongs with stage and tier. Accepted as yes/no/true/false/1/0
+// in any case; the export writes yes/no, so an edited export round-trips. A blank cell leaves it alone,
+// like every other column here, so un-flagging takes an explicit "no".
 //
 // The id-matching guarantee above makes email exactly as safe here as stage or priority_tier — there is
 // no name collision to get wrong, because there is no name involved. What makes email different from a
@@ -51,7 +55,7 @@
 import { Hono } from "hono";
 import { parseCsv } from "./importer";
 import { esc, layout } from "./views";
-import {
+import { PRIORITY_DEFAULT_CADENCE,
   MAX_PRIORITY_TIER,
   STAGES,
   STATUSES,
@@ -60,10 +64,10 @@ import {
   type Bindings,
   type D1Db,
 } from "./types";
+import { actor } from "./auth";
 
 const app = new Hono<{ Bindings: Bindings }>();
 
-const ACTOR = "operator";
 
 /** How many UPDATE statements go in one D1 batch. See the commit handler. */
 const BATCH_SIZE = 50;
@@ -71,25 +75,23 @@ const BATCH_SIZE = 50;
 /**
  * The stage-event origin written for changes made through this route, and the reason it exists.
  *
- * A bulk sweep is RECLASSIFICATION, not relationship movement. When the operator marks hundreds of
- * people Retired because they worked through a spreadsheet, nothing happened between them and those
- * people — the record caught up with what was already true. /pipeline exists to answer "where are
- * relationships going", and hundreds of arrivals into Retired in one second would swamp every real
- * signal on the page.
+ * A bulk sweep is RECLASSIFICATION, not relationship movement. When the owner marks 400 people Retired
+ * because he worked through a spreadsheet, nothing happened between him and those people — the record
+ * caught up with what was already true. /pipeline exists to answer "where are relationships going",
+ * and 400 arrivals into Retired in one second would swamp every real signal on the page.
  *
  * So the event is still WRITTEN — the history must not lie about the record having changed — and it is
  * excluded from the movement counts, the same way same-stage saves already are. This is the second
- * time this exact trap has come up (2026-08-20, correcting a large batch of imported stages), which is
- * why the exclusion now lives in pipeline.ts as a named rule rather than being cleaned up after the fact.
+ * time this exact trap has come up (2026-08-20, correcting 1,105 imported stages), which is why the
+ * exclusion now lives in pipeline.ts as a named rule rather than being cleaned up after the fact.
  *
- * The consequence to be honest about: a stage change made through a file will never appear in the
- * movement report, even if a real conversation caused it. Real movement goes through the contact
- * record, one person at a time. Stated on the preview so the choice is visible before the operator
- * commits.
+ * The consequence to be honest about: a stage change the owner makes through a file will never appear in
+ * the movement report, even if a real conversation caused it. Real movement goes through the contact
+ * record, one person at a time. Stated on the preview so the choice is visible before he commits.
  */
 const BULK_ORIGIN = "bulk-update";
 
-const FIELDS = ["stage", "priority_tier", "strength", "status", "email_work", "email_personal"] as const;
+const FIELDS = ["stage", "priority_tier", "is_priority", "strength", "status", "email_work", "email_personal"] as const;
 type Field = (typeof FIELDS)[number];
 
 // Widened to Set<string> deliberately: these are checked against arbitrary spreadsheet text, so the
@@ -103,6 +105,7 @@ const STATUS_VALUES: Set<string> = new Set(STATUSES.map(([v]) => v));
 const LABELS: Record<Field, string> = {
   stage: "Stage",
   priority_tier: "Priority Tier",
+  is_priority: "Priority Contact",
   strength: "Strength",
   status: "Status",
   email_work: "Work Email",
@@ -122,6 +125,8 @@ interface Current {
   organization: string | null;
   stage: string;
   priority_tier: number | null;
+  is_priority: number;
+  touch_interval_days: number | null;
   strength: string | null;
   status: string;
   email_work: string | null;
@@ -145,13 +150,14 @@ interface StagedUpdate {
 
 const clean = (v: string | undefined): string => (v ?? "").trim();
 
-/** Human display for a stored value, so the preview reads in plain words rather than the column's. */
+/** Human display for a stored value, so the preview reads in the owner's words rather than the column's. */
 function show(field: Field, value: string | number | null): string {
   if (value === null || value === "") return "not set";
   const v = String(value);
   if (field === "stage") return stageLabel(v);
   if (field === "strength") return STRENGTHS.find(([k]) => k === v)?.[1] ?? v;
   if (field === "status") return STATUSES.find(([k]) => k === v)?.[1] ?? v;
+  if (field === "is_priority") return v === "1" ? "yes" : "no";
   return v;
 }
 
@@ -171,6 +177,11 @@ function normalize(field: Field, raw: string): string | null {
     if (!/^\d+$/.test(v)) return null;
     const n = Number(v);
     return n >= 1 && n <= MAX_PRIORITY_TIER ? String(n) : null;
+  }
+  if (field === "is_priority") {
+    if (["1", "yes", "y", "true"].includes(key)) return "1";
+    if (["0", "no", "n", "false"].includes(key)) return "0";
+    return null;
   }
   if (field === "stage") {
     if (STAGE_VALUES.has(key)) return key;
@@ -220,7 +231,9 @@ export function stageUpdate(
       errors.push(
         f === "priority_tier"
           ? `priority_tier "${raw}" is not a whole number between 1 and ${MAX_PRIORITY_TIER}`
-          : EMAIL_FIELDS.has(f)
+          : f === "is_priority"
+            ? `is_priority "${raw}" is not yes or no`
+            : EMAIL_FIELDS.has(f)
             ? `${LABELS[f]} "${raw}" does not look like an email address`
             : `${f} "${raw}" is not a recognized ${LABELS[f].toLowerCase()}`
       );
@@ -245,7 +258,7 @@ async function loadCurrent(db: D1Db, ids: number[]): Promise<Map<number, Current
     const slice = unique.slice(i, i + 90);
     const { results } = await db
       .prepare(
-        `SELECT c.id, c.full_name, o.name AS organization, c.stage, c.priority_tier, c.strength, c.status,
+        `SELECT c.id, c.full_name, o.name AS organization, c.stage, c.priority_tier, c.is_priority, c.touch_interval_days, c.strength, c.status,
                 c.email_work, c.email_personal
            FROM contact c LEFT JOIN organization o ON o.id = c.organization_id
           WHERE c.id IN (${slice.map(() => "?").join(",")})`
@@ -261,7 +274,7 @@ async function loadCurrent(db: D1Db, ids: number[]): Promise<Map<number, Current
 
 app.get("/update", (c) =>
   c.html(
-    layout({
+    layout({ c,
       title: "Update Contacts from a File",
       body: `<main>
   <h1>Update Contacts from a File</h1>
@@ -280,7 +293,7 @@ app.get("/update", (c) =>
     <h2>Start from an export</h2>
     <p class="meta" style="margin:0 0 8px">Rows are matched on <code>id</code>, so the file has to come from
       <a href="/export">Export</a> — <code>/export/contacts.csv</code> already carries <code>id</code>,
-      <code>stage</code>, <code>priority_tier</code>, <code>strength</code>, <code>status</code>,
+      <code>stage</code>, <code>priority_tier</code>, <code>is_priority</code> (yes/no), <code>strength</code>, <code>status</code>,
       <code>email_work</code> and <code>email_personal</code>. Download it, change the columns you want in Excel,
       upload it back. Matching on the id means nothing else in the file has to be right, and a three-column file of
       <code>id, stage, priority_tier</code> works just as well as the full export.</p>
@@ -320,7 +333,7 @@ app.post("/update/preview", async (c) => {
   const grid = parseCsv(text);
   const bail = (msg: string) =>
     c.html(
-      layout({
+      layout({ c,
         title: "Update Contacts from a File",
         body: `<main><div class="flash warn">${esc(msg)}</div><p><a href="/update">Try another file</a></p></main>`,
       })
@@ -422,7 +435,7 @@ app.post("/update/preview", async (c) => {
   );
 
   return c.html(
-    layout({
+    layout({ c,
       title: "Update Contacts from a File",
       body: `<main>
   <h1>Review These Updates</h1>
@@ -502,7 +515,7 @@ app.post("/update/commit", async (c) => {
   // contact page since — in which case that field is no longer ours to overwrite from a stale file.
   const current = await loadCurrent(c.env.DB, chosen.map((s) => s.id));
 
-  const applied: { id: number; name: string; changes: Change[] }[] = [];
+  const applied: { id: number; name: string; changes: Change[]; cadenceDefaulted?: boolean }[] = [];
   const stale: string[] = [];
   const statements: ReturnType<D1Db["prepare"]>[] = [];
 
@@ -530,14 +543,18 @@ app.post("/update/commit", async (c) => {
     });
     if (!live.length) continue;
 
-    const sets = live.map((ch) => `${ch.field}=?`).join(", ");
+    // Newly ★ Priority with no cadence gets the default, same rule as the contact form (2026-09-25).
+    const cadenceDefaulted = live.some((ch) => ch.field === "is_priority" && ch.to === "1") && !cur.touch_interval_days;
+    const sets =
+      live.map((ch) => `${ch.field}=?`).join(", ") +
+      (cadenceDefaulted ? `, touch_interval_days = COALESCE(touch_interval_days, ${PRIORITY_DEFAULT_CADENCE})` : "");
     statements.push(
       c.env.DB.prepare(`UPDATE contact SET ${sets}, updated_at=datetime('now') WHERE id=?`).bind(
-        ...live.map((ch) => (ch.field === "priority_tier" ? Number(ch.to) : ch.to)),
+        ...live.map((ch) => (ch.field === "priority_tier" || ch.field === "is_priority" ? Number(ch.to) : ch.to)),
         s.id
       )
     );
-    applied.push({ id: s.id, name: cur.full_name, changes: live });
+    applied.push({ id: s.id, name: cur.full_name, changes: live, cadenceDefaulted });
   }
 
   /*
@@ -577,11 +594,12 @@ app.post("/update/commit", async (c) => {
   );
   const auditRows = applied.map((a) =>
     auditStmt.bind(
-      ACTOR,
+      actor(),
       "contact",
       String(a.id),
       a.name,
       a.changes.map((ch) => `${ch.field} ${show(ch.field, ch.from)} → ${show(ch.field, ch.to)}`).join("; ") +
+        (a.cadenceDefaulted ? `; touch_interval_days none → ${PRIORITY_DEFAULT_CADENCE} (priority default)` : "") +
         ` (bulk update from ${filename})`,
       correlation
     )
@@ -595,7 +613,7 @@ app.post("/update/commit", async (c) => {
      VALUES (?,?,?,?,?,?,?,?)`
   )
     .bind(
-      ACTOR,
+      actor(),
       "contact",
       "batch",
       "bulk-update",
@@ -609,7 +627,7 @@ app.post("/update/commit", async (c) => {
     .run();
 
   return c.html(
-    layout({
+    layout({ c,
       title: "Updates Applied",
       body: `<main>
   <h1>Updates Applied</h1>

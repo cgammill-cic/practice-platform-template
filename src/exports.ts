@@ -86,6 +86,7 @@ interface ContactExportRow {
   stage: string;
   strength: string | null;
   priority_tier: number | null;
+  is_priority: number;
   email_work: string | null;
   email_personal: string | null;
   phone: string | null;
@@ -109,7 +110,7 @@ interface ContactExportRow {
 
 const CONTACT_SQL = `SELECT
     c.id, c.full_name, c.title, o.name AS organization, c.department, c.stage, c.strength,
-    c.priority_tier, c.email_work, c.email_personal, c.phone, c.linkedin_url, c.birthday,
+    c.priority_tier, c.is_priority, c.email_work, c.email_personal, c.phone, c.linkedin_url, c.birthday,
     c.last_touch, c.next_follow_up, c.meeting_date, c.meeting_time, c.escalation_rung,
     (SELECT r.full_name FROM contact r WHERE r.id = c.referral_source_contact_id) AS referred_by,
     (SELECT group_concat(name, '; ') FROM
@@ -139,6 +140,7 @@ async function contactRows(db: Bindings["DB"]): Promise<{ headers: string[]; row
     "stage_label",
     "strength",
     "priority_tier",
+    "is_priority",
     "email_work",
     "email_personal",
     "phone",
@@ -170,6 +172,9 @@ async function contactRows(db: Bindings["DB"]): Promise<{ headers: string[]; row
     stageLabel(r.stage),
     r.strength,
     r.priority_tier,
+    // "yes"/"no" rather than 1/0 (migration 0029): the column is read by a person in a spreadsheet, and
+    // bulk update accepts the same words back, so an edited export round-trips without translation.
+    r.is_priority ? "yes" : "no",
     r.email_work,
     r.email_personal,
     r.phone,
@@ -275,7 +280,7 @@ app.get("/export", async (c) => {
   const tagLinks = counts?.tag_links ?? 0;
 
   return c.html(
-    layout({
+    layout({ c,
       title: "Export",
       body: `<main>
   <h1>Export</h1>

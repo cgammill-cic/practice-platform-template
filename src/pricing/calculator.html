@@ -1,0 +1,360 @@
+<!--
+  Pricing calculator (2026-09-25). Bundled as a Text module by wrangler (default rule for *.html) and
+  rendered inside layout() by src/pricing.ts, so it gets the rail, sign-in and the app's theme.
+
+  The same calculator also exists as a standalone file in OneDrive (Templates) and as a Claude Artifact.
+  This copy's CSS is scoped under .pricing and uses the app's tokens (--accent, --surface, --line...), so it
+  follows dark/light with the rest of the app. Inputs are saved per browser in localStorage, nothing on
+  the server.
+-->
+<style>
+.pricing .wrap { padding-block: 8px 40px; max-width: 1180px; margin: 0 auto; display: grid; gap: 28px; }
+.pricing .num, .pricing input[type=number], .pricing .mono { font-family: "JetBrains Mono", ui-monospace, Consolas, monospace; font-variant-numeric: tabular-nums; }
+.pricing header { display: grid; gap: 8px; max-width: 72ch; }
+.pricing .eyebrow { font: 600 12px/1 "Sora", system-ui, sans-serif; letter-spacing: .12em; text-transform: uppercase; color: var(--accent); }
+.pricing h1 { font: 700 clamp(28px, 4vw, 40px)/1.05 "Sora", system-ui, sans-serif; margin: 0; text-wrap: balance; letter-spacing: -.01em; }
+.pricing header p { margin: 0; color: var(--muted); }
+.pricing .layout { display: grid; grid-template-columns: minmax(0, 380px) minmax(0, 1fr); gap: 28px; align-items: start; }
+@media (max-width: 900px) {
+  .pricing .layout { grid-template-columns: minmax(0, 1fr); }
+}
+.pricing .inputs { display: grid; gap: 22px; }
+.pricing fieldset { border: 0; margin: 0; padding: 0; display: grid; gap: 10px; }
+.pricing legend { font: 700 16px/1.2 "Sora", system-ui, sans-serif; padding: 0 0 4px; }
+.pricing .hint { font-size: 13px; color: var(--faint); margin: -6px 0 2px; }
+.pricing .field { display: grid; grid-template-columns: minmax(0, 1fr) 132px; gap: 10px; align-items: center; }
+.pricing .field label { font-size: 14px; color: var(--muted); }
+.pricing .box { display: flex; align-items: center; background: var(--surface); border: 1px solid var(--line); border-radius: 7px; padding: 0 9px; }
+.pricing .box:focus-within { border-color: var(--accent); box-shadow: 0 0 0 3px var(--accent-tint); }
+.pricing .box span { color: var(--faint); font-size: 13px; }
+.pricing .box input { width: 100%; border: 0; background: transparent; color: var(--ink); font-size: 14px; padding: 8px 2px; text-align: right; outline: none; }
+.pricing .range { display: grid; gap: 4px; }
+.pricing .range-top { display: flex; justify-content: space-between; font-size: 14px; color: var(--muted); }
+.pricing .range-top b { color: var(--ink); font-weight: 600; }
+.pricing input[type=range] { width: 100%; accent-color: var(--accent); }
+.pricing .resetrow { display: flex; gap: 10px; flex-wrap: wrap; }
+.pricing button { font: 600 14px "Sora", system-ui, sans-serif; border-radius: 7px; padding: 9px 14px; cursor: pointer; border: 1px solid var(--line); background: var(--surface); color: var(--ink); }
+.pricing button:hover { border-color: var(--accent); }
+.pricing button:focus-visible, .pricing input:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
+.pricing button.primary { background: var(--accent); border-color: var(--accent); color: #fff; }
+.pricing .results { display: grid; gap: 22px; }
+.pricing .panel { background: var(--surface); border: 1px solid var(--line); border-radius: 12px; box-shadow: var(--shadow); padding: 20px 22px; display: grid; gap: 14px; }
+.pricing .panel h2 { font: 700 19px/1.2 "Sora", system-ui, sans-serif; margin: 0; }
+.pricing .panel .sub { margin: -8px 0 0; color: var(--muted); font-size: 14px; }
+.pricing .verdict { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 0; border: 1px solid var(--line); border-radius: 10px; overflow: hidden; }
+.pricing .verdict > div { padding: 14px 16px; display: grid; gap: 2px; border-right: 1px solid var(--line); }
+.pricing .verdict > div:last-child { border-right: 0; }
+.pricing .verdict .k { font-size: 12px; letter-spacing: .06em; text-transform: uppercase; color: var(--faint); }
+.pricing .verdict .v { font: 500 24px/1.2 "JetBrains Mono", monospace; font-variant-numeric: tabular-nums; }
+.pricing .verdict .n { font-size: 13px; color: var(--muted); }
+.pricing .verdict .fair .v { color: var(--accent); }
+@media (max-width: 560px) {
+  .pricing .verdict { grid-template-columns: 1fr; }
+  .pricing .verdict > div { border-right: 0; border-bottom: 1px solid var(--line); }
+  .pricing .verdict > div:last-child { border-bottom: 0; }
+}
+.pricing .chart { display: grid; gap: 8px; }
+.pricing .crow { display: grid; grid-template-columns: minmax(0, 170px) minmax(0, 1fr) 64px; gap: 12px; align-items: center; }
+.pricing .crow .cl { font-size: 13px; color: var(--muted); line-height: 1.25; }
+.pricing .crow .cl b { color: var(--ink); font-weight: 600; }
+.pricing .crow .cv { font: 500 13px "JetBrains Mono", monospace; font-variant-numeric: tabular-nums; text-align: right; }
+.pricing .ctrack { position: relative; height: 18px; background: var(--surface-2); border-radius: 4px; overflow: hidden; }
+.pricing .cband { position: absolute; top: 0; bottom: 0; background: var(--amber); opacity: .28; }
+.pricing .cbar { position: absolute; left: 0; top: 4px; bottom: 4px; border-radius: 3px; background: var(--faint); }
+.pricing .crow.fee .cbar { background: var(--accent); top: 2px; bottom: 2px; }
+.pricing .crow.fee .cv, .pricing .crow.fee .cl b { color: var(--accent); }
+.pricing .crow.floor .cbar { background: var(--red); }
+@media (max-width: 480px) {
+  .pricing .crow { grid-template-columns: minmax(0, 1fr) 64px; }
+  .pricing .crow .ctrack { grid-column: 1 / -1; grid-row: 2; }
+}
+.pricing .legend { display: flex; flex-wrap: wrap; gap: 16px; font-size: 13px; color: var(--muted); }
+.pricing .legend i { display: inline-block; width: 14px; height: 10px; border-radius: 3px; background: var(--amber); opacity: .45; margin-right: 6px; vertical-align: middle; }
+.pricing .models { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 14px; }
+@media (max-width: 640px) {
+  .pricing .models { grid-template-columns: 1fr; }
+}
+.pricing .model { border: 1px solid var(--line); border-radius: 10px; padding: 16px; display: grid; gap: 10px; align-content: start; background: var(--surface); }
+.pricing .model.best { border-color: var(--accent); box-shadow: 0 0 0 1px var(--accent) inset; }
+.pricing .model-h { display: flex; justify-content: space-between; align-items: baseline; gap: 8px; flex-wrap: wrap; }
+.pricing .model h3 { margin: 0; font: 700 16px/1.2 "Sora", system-ui, sans-serif; }
+.pricing .tag { font-size: 11px; font-weight: 600; letter-spacing: .06em; text-transform: uppercase; padding: 3px 8px; border-radius: 99px; background: var(--accent-tint); color: var(--amber); }
+.pricing .model .price { font: 500 26px/1.1 "JetBrains Mono", monospace; font-variant-numeric: tabular-nums; }
+.pricing .model .price small { font: 400 13px "Sora", system-ui, sans-serif; color: var(--muted); margin-left: 6px; }
+.pricing dl { margin: 0; display: grid; grid-template-columns: minmax(0, 1fr) auto; gap: 6px 12px; font-size: 13.5px; }
+.pricing dt { color: var(--muted); }
+.pricing dd { margin: 0; text-align: right; font-family: "JetBrains Mono", monospace; font-variant-numeric: tabular-nums; }
+.pricing .pill { display: inline-block; font-size: 12px; font-weight: 600; padding: 2px 8px; border-radius: 99px; }
+.pricing .pill.ok { background: var(--green-tint); color: var(--green); }
+.pricing .pill.low { background: var(--red-tint); color: var(--red); }
+.pricing .model p { margin: 0; font-size: 13.5px; color: var(--muted); }
+.pricing .notes { display: grid; gap: 8px; font-size: 13.5px; color: var(--muted); max-width: 80ch; }
+.pricing .notes p { margin: 0; }
+.pricing .toast { font-size: 13px; color: var(--green); min-height: 1em; }
+@media (prefers-reduced-motion: reduce) {
+  .pricing * { transition: none !important; }
+}
+</style>
+<div class="pricing">
+<div class="wrap">
+  <header>
+    <div class="eyebrow">{{FIRM}} · Pricing</div>
+    <h1>Price the value, not the hours</h1>
+    <p>Set what the build cost you, what a traditional team would charge, and what the application is worth to the client. The calculator shows the fair price band and compares four ways to charge. The starting figures are this practice platform's real numbers; change any of them for a new project.</p>
+  </header>
+
+  <div class="layout">
+    <form class="inputs" id="form" autocomplete="off">
+      <fieldset>
+        <legend>Your cost</legend>
+        <p class="hint">What delivering it actually took you.</p>
+        <div class="field"><label for="yourHours">Your hours on the project</label><div class="box"><input id="yourHours" type="number" min="1" step="1"><span>h</span></div></div>
+        <div class="field"><label for="yourRate">Your normal consulting rate</label><div class="box"><span>$</span><input id="yourRate" type="number" min="0" step="5"><span>/h</span></div></div>
+        <div class="field"><label for="toolCost">AI tools and hosting for the build</label><div class="box"><span>$</span><input id="toolCost" type="number" min="0" step="50"></div></div>
+        <div class="range">
+          <div class="range-top"><label for="riskMult">Risk and support multiplier</label><b class="num" id="riskMultOut"></b></div>
+          <input id="riskMult" type="range" min="1" max="3" step="0.05">
+        </div>
+      </fieldset>
+
+      <fieldset>
+        <legend>The client's alternatives</legend>
+        <p class="hint">What they'd otherwise pay to get the same thing.</p>
+        <div class="field"><label for="tradHours">Traditional team hours</label><div class="box"><input id="tradHours" type="number" min="0" step="50"><span>h</span></div></div>
+        <div class="field"><label for="marketRate">Agency blended rate</label><div class="box"><span>$</span><input id="marketRate" type="number" min="0" step="5"><span>/h</span></div></div>
+        <div class="field"><label for="otsUpfront">Off-the-shelf CRM: setup</label><div class="box"><span>$</span><input id="otsUpfront" type="number" min="0" step="1000"></div></div>
+        <div class="field"><label for="otsAnnual">Off-the-shelf CRM: per year</label><div class="box"><span>$</span><input id="otsAnnual" type="number" min="0" step="500"></div></div>
+      </fieldset>
+
+      <fieldset>
+        <legend>Value to the client</legend>
+        <p class="hint">What the application is worth to them each year.</p>
+        <div class="field"><label for="hoursSaved">Hours saved per week</label><div class="box"><input id="hoursSaved" type="number" min="0" step="0.5"><span>h</span></div></div>
+        <div class="field"><label for="clientRate">Value of the client's hour</label><div class="box"><span>$</span><input id="clientRate" type="number" min="0" step="5"><span>/h</span></div></div>
+        <div class="field"><label for="weeks">Working weeks per year</label><div class="box"><input id="weeks" type="number" min="1" max="52" step="1"></div></div>
+        <div class="field"><label for="pipeline">Extra won work per year</label><div class="box"><span>$</span><input id="pipeline" type="number" min="0" step="1000"></div></div>
+        <div class="field"><label for="horizon">Years the value lasts</label><div class="box"><input id="horizon" type="number" min="1" max="10" step="1"><span>yrs</span></div></div>
+      </fieldset>
+
+      <fieldset>
+        <legend>Pricing levers</legend>
+        <div class="range">
+          <div class="range-top"><label for="feePct">Fixed fee, as a share of the traditional build</label><b class="num" id="feePctOut"></b></div>
+          <input id="feePct" type="range" min="5" max="60" step="1">
+        </div>
+        <div class="field"><label for="clients">Product: number of clients</label><div class="box"><input id="clients" type="number" min="1" step="1"></div></div>
+        <div class="field"><label for="setupFee">Product: setup fee per client</label><div class="box"><span>$</span><input id="setupFee" type="number" min="0" step="500"></div></div>
+        <div class="field"><label for="setupHours">Product: your setup hours per client</label><div class="box"><input id="setupHours" type="number" min="0" step="1"><span>h</span></div></div>
+        <div class="field"><label for="monthly">Product: monthly subscription</label><div class="box"><span>$</span><input id="monthly" type="number" min="0" step="50"><span>/mo</span></div></div>
+        <div class="field"><label for="supportHours">Product: support hours per client per month</label><div class="box"><input id="supportHours" type="number" min="0" step="0.5"><span>h</span></div></div>
+        <div class="field"><label for="retainer">Retainer per month</label><div class="box"><span>$</span><input id="retainer" type="number" min="0" step="250"><span>/mo</span></div></div>
+        <div class="field"><label for="retHours">Your retainer hours per month</label><div class="box"><input id="retHours" type="number" min="0" step="1"><span>h</span></div></div>
+      </fieldset>
+
+      <div class="resetrow">
+        <button type="button" class="primary" id="copy">Copy summary</button>
+        <button type="button" id="reset">Reset to this project</button>
+      </div>
+      <div class="toast" id="toast" role="status" aria-live="polite"></div>
+    </form>
+
+    <div class="results">
+      <section class="panel" aria-labelledby="h-band">
+        <h2 id="h-band">Fair price band</h2>
+        <p class="sub" id="bandSub"></p>
+        <div class="verdict">
+          <div><span class="k">Your floor</span><span class="v" id="vFloor"></span><span class="n" id="nFloor"></span></div>
+          <div class="fair"><span class="k">Fair range</span><span class="v" id="vBand"></span><span class="n" id="nBand"></span></div>
+          <div><span class="k">Client's alternative</span><span class="v" id="vRepl"></span><span class="n" id="nRepl"></span></div>
+        </div>
+        <div class="chart" id="ladder"></div>
+        <div class="legend"><span><i></i>Fair band: above your floor, well below what the alternative or the value would justify</span></div>
+      </section>
+
+      <section class="panel" aria-labelledby="h-models">
+        <h2 id="h-models">Four ways to charge</h2>
+        <p class="sub">Each shows what you earn per hour of your time and what the client saves. The strongest option for these numbers is outlined.</p>
+        <div class="models" id="models"></div>
+      </section>
+
+      <div class="notes">
+        <p><b>How the numbers are built.</b> Floor = your hours × your rate × the risk multiplier, plus tools. The fair range starts at the floor and tops out at the lower of 40% of the traditional build or half of the value over the years it lasts. Effective rate = what you're paid ÷ the hours it costs you.</p>
+        <p>The rates, CRM costs and hour estimates are rules of thumb, not quotes. Check them against a couple of local bids before you put a number in a proposal. Your entries are saved in this browser only.</p>
+      </div>
+    </div>
+  </div>
+</div>
+</div>
+<script>
+(() => {
+  // This practice platform's own figures (2026-09-24): ~100 h of your time, a 1,400–2,000 h
+  // traditional estimate (midpoint 1,700), and the rule-of-thumb market rates from the analysis.
+  const DEFAULTS = {
+    yourHours: 100, yourRate: 250, toolCost: 400, riskMult: 1.75,
+    tradHours: 1700, marketRate: 160, otsUpfront: 50000, otsAnnual: 12000,
+    hoursSaved: 3, clientRate: 250, weeks: 48, pipeline: 0, horizon: 3,
+    feePct: 25, clients: 5, setupFee: 10000, setupHours: 8, monthly: 600, supportHours: 1.5,
+    retainer: 4000, retHours: 10,
+  };
+  const KEY = "cic-pricing-calc-v1";
+  const $ = (id) => document.getElementById(id);
+  const ids = Object.keys(DEFAULTS);
+  let saved = {};
+  try { saved = JSON.parse(localStorage.getItem(KEY) || "{}") || {}; } catch (e) { saved = {}; }
+  ids.forEach((k) => { $(k).value = saved[k] ?? DEFAULTS[k]; });
+
+  const usd = (n) => (n < 0 ? "−$" : "$") + Math.round(Math.abs(n)).toLocaleString("en-US");
+  const short = (n) => Math.abs(n) >= 1e6 ? "$" + (n / 1e6).toFixed(n >= 1e7 ? 0 : 1) + "M" : Math.abs(n) >= 1e3 ? "$" + Math.round(n / 1e3) + "K" : usd(n);
+  const rate = (n) => (isFinite(n) ? usd(n) + "/h" : "n/a");
+  const pct = (n) => Math.round(n * 100) + "%";
+  const esc = (s) => String(s).replace(/[&<>"]/g, (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;" }[c]));
+
+  function read() {
+    const v = {};
+    ids.forEach((k) => { const n = parseFloat($(k).value); v[k] = isFinite(n) ? n : 0; });
+    return v;
+  }
+
+  let lastSummary = "";
+  function render() {
+    const v = read();
+    try { localStorage.setItem(KEY, JSON.stringify(v)); } catch (e) {}
+    $("riskMultOut").textContent = v.riskMult.toFixed(2) + "×";
+    $("feePctOut").textContent = v.feePct + "%";
+
+    const floor = v.yourHours * v.yourRate * v.riskMult + v.toolCost;
+    const repl = v.tradHours * v.marketRate;
+    const annual = v.hoursSaved * v.clientRate * v.weeks + v.pipeline;
+    const horizonValue = annual * v.horizon;
+    const ots = v.otsUpfront + v.otsAnnual * v.horizon;
+    const ceiling = Math.max(floor, Math.min(0.4 * repl, 0.5 * horizonValue));
+
+    // Fixed fee
+    const fee = (v.feePct / 100) * repl;
+    const feeRate = fee / v.yourHours;
+    // Productized, first year across all clients
+    const perClient = v.setupFee + 12 * v.monthly;
+    const prodRevenue = perClient * v.clients;
+    const prodHours = v.yourHours + v.clients * (v.setupHours + 12 * v.supportHours);
+    const prodRate = prodRevenue / prodHours;
+    const clientYear1 = perClient;
+    // Retainer, one year
+    const retYear = v.retainer * 12;
+    const retRate = v.retHours ? v.retainer / v.retHours : Infinity;
+    // Hybrid: fixed fee + one year of retainer
+    const hybrid = fee + retYear;
+    const hybridRate = hybrid / (v.yourHours + 12 * v.retHours);
+
+    const payback = annual > 0 ? fee / (annual / 12) : Infinity;
+    const clientAlt = Math.min(repl, ots || repl);
+
+    $("bandSub").textContent = `A ${v.horizon}-year value of ${usd(horizonValue)} against a traditional build of ${usd(repl)}.`;
+    $("vFloor").textContent = short(floor);
+    $("nFloor").textContent = `${v.yourHours} h × $${v.yourRate} × ${v.riskMult.toFixed(2)} + tools`;
+    $("vBand").textContent = `${short(floor)}–${short(ceiling)}`;
+    $("nBand").textContent = ceiling <= floor ? "The value doesn't clear your floor" : `Your fee is ${short(fee)}`;
+    $("vRepl").textContent = short(repl);
+    $("nRepl").textContent = `Off-the-shelf over ${v.horizon} yrs: ${short(ots)}`;
+
+    // Chart: one linear scale from 0 to the largest reference point.
+    const pts = [
+      { k: "floor", name: "Your floor", val: floor },
+      { k: "fee", name: `Your fixed fee (${v.feePct}%)`, val: fee },
+      { k: "ots", name: `Off-the-shelf, ${v.horizon} yrs`, val: ots },
+      { k: "value", name: `Value to client, ${v.horizon} yrs`, val: horizonValue },
+      { k: "repl", name: "Traditional build", val: repl },
+    ];
+    const max = Math.max(...pts.map((p) => p.val), 1) * 1.02;
+    const x = (n) => Math.max(0, Math.min(100, (n / max) * 100));
+    const bandL = x(floor), bandW = Math.max(0.8, x(ceiling) - x(floor));
+    let html = "";
+    pts.sort((a, b) => a.val - b.val).forEach((p) => {
+      html += `<div class="crow ${p.k}"><div class="cl"><b>${esc(p.name)}</b></div><div class="ctrack" role="img" aria-label="${esc(p.name)}: ${usd(p.val)}"><div class="cband" style="left:${bandL}%;width:${bandW}%"></div><div class="cbar" style="width:${x(p.val)}%"></div></div><div class="cv">${short(p.val)}</div></div>`;
+    });
+    $("ladder").innerHTML = html;
+
+    // A price is judged against both ends of the fair band: below the floor you're underpaid, above the
+    // ceiling the value to the client no longer justifies it.
+    const vsFloor = (amt) => amt < floor
+      ? `<span class="pill low">Below your floor</span>`
+      : amt > ceiling
+        ? `<span class="pill low">Above the fair range: raise the value or lower the fee</span>`
+        : `<span class="pill ok">Within the fair range</span>`;
+    const models = [
+      {
+        key: "fixed", name: "Fixed fee", tag: "One project", price: fee, unit: "one time",
+        rows: [["Your effective rate", rate(feeRate)], ["Client saves vs. traditional", `${usd(repl - fee)} (${pct(1 - fee / repl)})`], ["Share of value over " + v.horizon + " yrs", horizonValue ? pct(fee / horizonValue) : "n/a"], ["Client payback", isFinite(payback) ? payback.toFixed(1) + " months" : "n/a"]],
+        check: vsFloor(fee), note: "Best when the scope is clear and the client wants a firm number. Price the outcome, and scope change orders separately.",
+        score: fee >= floor && fee <= ceiling ? feeRate : 0,
+      },
+      {
+        key: "product", name: "Productized", tag: `${v.clients} clients`, price: prodRevenue, unit: "first year, all clients",
+        rows: [["Per client, year one", usd(clientYear1)], ["Your effective rate", rate(prodRate)], ["Recurring per year after", usd(12 * v.monthly * v.clients)], ["Client's year one vs. off-the-shelf", ots ? pct(clientYear1 / (v.otsUpfront + v.otsAnnual)) : "n/a"]],
+        check: prodRevenue < floor
+          ? `<span class="pill low">Year one doesn't cover your floor: add clients or raise the fees</span>`
+          : clientYear1 > ceiling
+            ? `<span class="pill low">Each client pays more than the fair range</span>`
+            : `<span class="pill ok">Covers your floor; fair for each client</span>`, note: "Best when the same app fits several clients. You're paid many times for work already done, as long as you keep the rights to the code.",
+        score: prodRevenue >= floor && clientYear1 <= ceiling ? prodRate : 0,
+      },
+      {
+        key: "retainer", name: "Retainer", tag: "Ongoing", price: retYear, unit: "per year",
+        rows: [["Per month", usd(v.retainer)], ["Your effective rate", rate(retRate)], ["Your hours per year", Math.round(12 * v.retHours) + " h"]],
+        check: "", note: "Best for a steady flow of enhancements. Price by what gets delivered each month, not by the hour.",
+        score: 0,
+      },
+      {
+        key: "hybrid", name: "Hybrid", tag: "Fee + retainer", price: hybrid, unit: "year one",
+        rows: [["Fixed fee", usd(fee)], ["Plus retainer, 12 months", usd(retYear)], ["Your effective rate", rate(hybridRate)], ["Client saves vs. traditional, year one", usd(repl - hybrid)]],
+        check: vsFloor(fee), note: "Usually the strongest: the fee pays back your build, and the retainer pays for the value that keeps coming.",
+        // Nudged up because recurring revenue is worth more than its rate alone suggests.
+        score: fee >= floor && fee <= ceiling ? hybridRate * 1.15 : 0,
+      },
+    ];
+    const best = models.reduce((a, m) => (m.score > a.score ? m : a), models[0]);
+    $("models").innerHTML = models.map((m) => `
+      <article class="model${m === best && best.score > 0 ? " best" : ""}">
+        <div class="model-h"><h3>${esc(m.name)}</h3><span class="tag">${m === best && best.score > 0 ? "Strongest" : esc(m.tag)}</span></div>
+        <div class="price">${usd(m.price)}<small>${esc(m.unit)}</small></div>
+        <dl>${m.rows.map(([a, b]) => `<dt>${esc(a)}</dt><dd>${esc(b)}</dd>`).join("")}</dl>
+        ${m.check}
+        <p>${esc(m.note)}</p>
+      </article>`).join("");
+
+    lastSummary = [
+      "Pricing summary",
+      `Your floor: ${usd(floor)} (${v.yourHours} h × $${v.yourRate}/h × ${v.riskMult.toFixed(2)} + ${usd(v.toolCost)} tools)`,
+      `Traditional build: ${usd(repl)} (${v.tradHours} h × $${v.marketRate}/h); off-the-shelf over ${v.horizon} yrs: ${usd(ots)}`,
+      `Value to client: ${usd(annual)} per year, ${usd(horizonValue)} over ${v.horizon} yrs`,
+      `Fair range: ${usd(floor)} to ${usd(ceiling)}`,
+      `Fixed fee (${v.feePct}% of traditional): ${usd(fee)}, effective ${rate(feeRate)}, client saves ${pct(1 - fee / repl)}`,
+      `Productized: ${usd(v.setupFee)} setup + ${usd(v.monthly)}/mo × ${v.clients} clients = ${usd(prodRevenue)} year one, effective ${rate(prodRate)}`,
+      `Retainer: ${usd(v.retainer)}/mo (${usd(retYear)}/yr), effective ${rate(retRate)}`,
+      `Hybrid: ${usd(fee)} + ${usd(retYear)} = ${usd(hybrid)} year one, effective ${rate(hybridRate)}`,
+    ].join("\n");
+  }
+
+  $("form").addEventListener("input", render);
+  $("form").addEventListener("submit", (e) => e.preventDefault());
+  $("reset").addEventListener("click", () => {
+    ids.forEach((k) => { $(k).value = DEFAULTS[k]; });
+    render();
+    $("toast").textContent = "Reset to this project's figures.";
+  });
+  $("copy").addEventListener("click", () => {
+    const done = () => { $("toast").textContent = "Summary copied."; };
+    try {
+      navigator.clipboard.writeText(lastSummary).then(done, () => { fallback(); });
+    } catch (e) { fallback(); }
+    function fallback() {
+      const ta = document.createElement("textarea");
+      ta.value = lastSummary; ta.setAttribute("readonly", ""); ta.style.position = "fixed"; ta.style.opacity = "0";
+      document.body.appendChild(ta); ta.select();
+      let ok = false; try { ok = document.execCommand("copy"); } catch (e) {}
+      document.body.removeChild(ta);
+      $("toast").textContent = ok ? "Summary copied." : "Copying isn't allowed here. Select the numbers on the page instead.";
+    }
+  });
+  render();
+})();
+</script>

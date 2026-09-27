@@ -1,4 +1,4 @@
--- 0021 — a small key/value table for operator preferences (DIGEST-001, 2026-09-02).
+-- 0021 — a small key/value table for operator preferences (DIGEST-001, the owner 2026-09-02).
 --
 -- WHY A TABLE AT ALL. The daily digest needs an off switch: "I would like to have an on off switch that
 -- would allow me to stop the daily digest if I don't find it useful or it's overly cumbersome." That is
@@ -31,8 +31,8 @@ CREATE TABLE app_setting (
 
 -- Seeded ON, which is the one debatable choice here.
 --
--- The digest was requested alongside a switch to stop it, in that order — so the feature arriving
--- switched off would mean shipping something that does nothing until the operator finds a control they
--- did not know they needed. The switch exists for the day it stops being useful, not for the day it ships.
--- Turning it off is one click on /health, and the off state persists.
+-- The owner asked for the digest and asked for a switch to stop it, in that order — so the feature arriving
+-- switched off would mean shipping something that does nothing until he finds a control he did not know
+-- he needed. The switch exists for the day it stops being useful, not for the day it ships. Turning it off
+-- is one click on /health, and the off state persists.
 INSERT INTO app_setting (key, value) VALUES ('digest_enabled', '1');

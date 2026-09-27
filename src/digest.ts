@@ -1,16 +1,17 @@
-// The daily digest — one weekday email telling the operator what needs doing (DIGEST-001).
+// The daily digest — one weekday email telling the owner what needs doing (DIGEST-001, 2026-09-02).
 //
-// THE POINT: the app comes to you. Everything else in here waits to be opened, which means the day fills
-// up and the outreach does not happen. A morning list of what is actually due is the smallest thing that
-// changes that.
+// THE POINT: the app comes to him. Everything else in here waits to be opened, which means the day fills
+// up and the outreach does not happen. His constraint right now is not billing — "I haven't sold work
+// yet" — it is consistent contact with 940 backlog contacts and a handful of live threads. A morning list
+// of what is actually due is the smallest thing that changes that.
 //
 // ---------------------------------------------------------------------------------------------------
 // FIVE DECISIONS
 //
-// 1. SENT THROUGH GRAPH AS THE OPERATOR, TO THE OPERATOR. No email vendor, no API key, no domain to
-//    verify, and open decision O-8 (which transactional email service) never has to be answered. Issue
-//    #95 assumed a vendor was required and it is not: the Outlook connection already exists, so one
-//    added scope does what an entire third-party integration was scoped to do.
+// 1. SENT THROUGH GRAPH AS THE OWNER, TO THE OWNER. No email vendor, no API key, no domain to verify, and
+//    open decision O-8 (which transactional email service) never has to be answered. Issue #95 assumed a
+//    vendor was required and it is not: the Outlook connection already exists, so one added scope does
+//    what an entire third-party integration was scoped to do.
 //
 // 2. IT ONLY EVER MAILS THE CONNECTED ACCOUNT. The recipient is `ms_connection.account_upn` — not a
 //    parameter, not a setting, not derived from anything a contact controls. `Mail.Send` is the first
@@ -35,25 +36,32 @@
 // ---------------------------------------------------------------------------------------------------
 
 import { Hono } from "hono";
+import { weeklyScorecard } from "./analytics";
+import { draftsWaiting } from "./outreach";
+import { describeUpdate, recentCalendarUpdates } from "./meetingsync";
 import { graphBase, msAccessToken, msConnection } from "./msgraph";
 import { pursuitsNeedingAttention } from "./pursuits";
-import { DIGEST_ENABLED, isOn, setSetting } from "./settings";
+import { DIGEST_ENABLED, appSettings, isOn, setSetting, zoneLabel } from "./settings";
+import { currentZone } from "./weeks";
 import { esc } from "./views";
-import type { Bindings, D1Db } from "./types";
+import { MEETING_TIME_ORDER, PRIORITY_FIRST_ORDER, type Bindings, type D1Db } from "./types";
+import { actor } from "./auth";
 
 const app = new Hono<{ Bindings: Bindings }>();
 
-const ACTOR = "operator";
 
 /** Rows shown per section before the email says "and N more". */
 const SECTION_LIMIT = 8;
 
-/** The hour, in the operator's zone, that the digest is meant to arrive in. See decision 4. */
-const SEND_HOUR_LOCAL = 6;
-const LOCAL_ZONE = "America/Chicago";
-
+/*
+ * WHEN IT SENDS (Phase 3a, 2026-09-25). The hour and the zone are settings (settings.ts: digest_hour,
+ * default 6; tz, default America/Chicago), so a copy anywhere gets its digest at its own 6am. That needs
+ * one cron every hour instead of the old pair tuned to Central's two UTC offsets: each tick asks
+ * isSendHour() in the copy's zone, and 23 of 24 return at once. Weekdays are judged in local time too,
+ * since Monday 6am in Sydney is still Sunday in UTC.
+ */
 /** Cron expressions that mean "maybe send the digest". The backup owns its own and is dispatched apart. */
-export const DIGEST_CRONS = new Set(["0 11 * * 1-5", "0 12 * * 1-5"]);
+export const DIGEST_CRONS = new Set(["0 * * * *"]);
 
 interface Line {
   who: string;
@@ -68,7 +76,7 @@ interface Section {
 }
 
 /**
- * Today's date in the operator's timezone, not the server's.
+ * Today's date in the owner's timezone, not the server's.
  *
  * Every "due today" and "overdue" below is measured against THIS, passed into the SQL as a bound value,
  * rather than against `date('now')` — which SQLite evaluates in UTC. At the scheduled 6am Central send the
@@ -78,21 +86,13 @@ interface Section {
  * the top of the email would disagree with the rows underneath it. Same bug as MAIL-001's UTC date slice,
  * caught the same way — by looking at real output rather than reasoning about it.
  */
-export function localToday(now: Date = new Date(), zone: string = LOCAL_ZONE): string {
-  try {
-    return new Intl.DateTimeFormat("en-CA", {
-      timeZone: zone,
-      year: "numeric",
-      month: "2-digit",
-      day: "2-digit",
-    }).format(now);
-  } catch {
-    return now.toISOString().slice(0, 10);
-  }
-}
+// Moved to weeks.ts (2026-09-25) so analytics.ts can use it without importing this module, which now
+// imports analytics for the Monday scorecard. Re-exported so existing imports keep working.
+import { localToday } from "./weeks";
+export { localToday };
 
 /**
- * A stored timestamp — `audit_event.ts`, which SQLite writes in UTC — rendered in the operator's zone.
+ * A stored timestamp — `audit_event.ts`, which SQLite writes in UTC — rendered in the owner's zone.
  *
  * Only /health's "last run" uses this. The question that panel answers is "did the digest go out this
  * morning?", and that is a local question: at 7pm Central the raw column reads 00:54 the following day,
@@ -105,32 +105,39 @@ export function localStamp(utc: string): string {
     const d = new Date(`${utc.replace(" ", "T")}Z`);
     if (Number.isNaN(d.getTime())) return utc;
     return `${new Intl.DateTimeFormat("en-GB", {
-      timeZone: LOCAL_ZONE,
+      timeZone: currentZone(),
       day: "numeric",
       month: "short",
       hour: "2-digit",
       minute: "2-digit",
       hour12: false,
-    }).format(d)} Central`;
+    }).format(d)} ${zoneLabel()}`;
   } catch {
     return utc;
   }
 }
 
-/** Is it currently the send hour in the operator's timezone? See decision 4 — this is the DST guard. */
-export function isSendHour(now: Date, zone: string = LOCAL_ZONE, hour: number = SEND_HOUR_LOCAL): boolean {
+/** Is it the send hour on a weekday, in the copy's timezone? See decision 4 — this is the DST guard. */
+export function isSendHour(now: Date, zone: string = currentZone(), hour: number = appSettings().digestHour): boolean {
   try {
-    const h = new Intl.DateTimeFormat("en-GB", {
-      timeZone: zone,
-      hour: "2-digit",
-      hour12: false,
-    }).format(now);
-    return Number(h) === hour;
+    const parts = Object.fromEntries(
+      new Intl.DateTimeFormat("en-US", { timeZone: zone, hour: "2-digit", hourCycle: "h23", weekday: "short" })
+        .formatToParts(now)
+        .map((x) => [x.type, x.value])
+    );
+    return Number(parts.hour) === hour && !["Sat", "Sun"].includes(parts.weekday);
   } catch {
     // A broken Intl must not mean two emails a day; it means none, and /health will say so.
     return false;
   }
 }
+
+/**
+ * Priority contacts (migration 0029) lead each contact list here, as they do on the dashboard, and carry a
+ * star so they stand out in a plain email. Meeting lists stay in time order: a day's schedule out of time
+ * order is a wrong schedule. Added 2026-09-25.
+ */
+const star = (r: Record<string, unknown>) => (r.is_priority ? "★ " : "");
 
 async function section(
   db: D1Db,
@@ -156,18 +163,39 @@ async function section(
 export async function buildDigest(db: D1Db, today: string = localToday()): Promise<Section[]> {
   const out: Section[] = [];
 
+  /*
+   * Monday scorecard (2026-09-25). On Mondays the email opens with three lines from Analytics: the
+   * priority circle's pace last week against plan, who is drifting, and reply rates. Not urgent, so the
+   * subject line's "N things need you today" is unchanged, but it is content, so a quiet Monday still
+   * sends: knowing the week was quiet is the point of a scorecard.
+   */
+  if (new Date(`${today}T12:00:00Z`).getUTCDay() === 1) {
+    const lines = await weeklyScorecard(db, today).catch(() => []);
+    if (lines.length) out.push({ title: "Your week: priority circle scorecard", urgent: false, lines, total: lines.length });
+  }
+
+  // Outreach drafts waiting (Phase 2a): a scheduled run may have drafted overnight. One line, linked.
+  const drafts = await draftsWaiting(db);
+  if (drafts)
+    out.push({
+      title: "Outreach drafts ready",
+      urgent: true,
+      lines: [{ who: `${drafts} outreach ${drafts === 1 ? "draft" : "drafts"} ready to review`, detail: "Review, send, then Log as Sent", href: "/outreach" }],
+      total: 1,
+    });
+
   out.push(
     await section(
       db,
       "Meetings today",
       true,
-      `SELECT c.id, c.full_name, ifnull(c.meeting_time,'') AS t, ifnull(o.name,'') AS org
+      `SELECT c.id, c.full_name, c.is_priority, ifnull(c.meeting_time,'') AS t, ifnull(o.name,'') AS org
          FROM contact c LEFT JOIN organization o ON o.id = c.organization_id
         WHERE c.status='active' AND c.meeting_date = ?
-        ORDER BY c.meeting_time, c.full_name`,
+        ORDER BY ${MEETING_TIME_ORDER}, c.full_name`,
       [today],
       (r) => ({
-        who: String(r.full_name),
+        who: star(r) + String(r.full_name),
         detail: [r.t, r.org].filter(Boolean).join(" · ") || "no time set",
         href: `/contacts/${r.id}`,
       })
@@ -179,13 +207,13 @@ export async function buildDigest(db: D1Db, today: string = localToday()): Promi
       db,
       "Action items due",
       true,
-      `SELECT a.id, a.description, a.due_date, c.id AS cid, c.full_name
+      `SELECT a.id, a.description, a.due_date, c.id AS cid, c.full_name, c.is_priority
          FROM action_item a JOIN contact c ON c.id = a.contact_id
         WHERE a.done = 0 AND a.due_date IS NOT NULL AND a.due_date <= ?
-        ORDER BY a.due_date, c.full_name`,
+        ORDER BY ${PRIORITY_FIRST_ORDER}, a.due_date, c.full_name`,
       [today],
       (r) => ({
-        who: String(r.full_name),
+        who: star(r) + String(r.full_name),
         detail: `${r.description} (due ${r.due_date})`,
         href: `/contacts/${r.cid}`,
       })
@@ -202,15 +230,15 @@ export async function buildDigest(db: D1Db, today: string = localToday()): Promi
       db,
       "Follow-ups overdue",
       true,
-      `SELECT c.id, c.full_name, c.next_follow_up, ifnull(o.name,'') AS org
+      `SELECT c.id, c.full_name, c.is_priority, c.next_follow_up, ifnull(o.name,'') AS org
          FROM contact c LEFT JOIN organization o ON o.id = c.organization_id
         WHERE c.status='active' AND c.next_follow_up IS NOT NULL AND c.next_follow_up <= ?
           AND c.meeting_date IS NULL
           AND c.stage NOT IN ('complete','no_response','retired','not_qualified','awaiting_response')
-        ORDER BY c.next_follow_up, c.full_name`,
+        ORDER BY ${PRIORITY_FIRST_ORDER}, c.next_follow_up, c.full_name`,
       [today],
       (r) => ({
-        who: String(r.full_name),
+        who: star(r) + String(r.full_name),
         detail: `due ${r.next_follow_up}${r.org ? ` · ${r.org}` : ""}`,
         href: `/contacts/${r.id}`,
       })
@@ -243,14 +271,14 @@ export async function buildDigest(db: D1Db, today: string = localToday()): Promi
       db,
       "Waiting on a reply",
       false,
-      `SELECT c.id, c.full_name, ifnull(o.name,'') AS org, c.escalation_rung AS rung,
+      `SELECT c.id, c.full_name, c.is_priority, ifnull(o.name,'') AS org, c.escalation_rung AS rung,
               ifnull(c.last_attempt_at,'') AS laa
          FROM contact c LEFT JOIN organization o ON o.id = c.organization_id
         WHERE c.status='active' AND c.stage='awaiting_response'
-        ORDER BY (c.last_attempt_at IS NULL), c.last_attempt_at`,
+        ORDER BY ${PRIORITY_FIRST_ORDER}, (c.last_attempt_at IS NULL), c.last_attempt_at`,
       [],
       (r) => ({
-        who: String(r.full_name),
+        who: star(r) + String(r.full_name),
         detail: `${r.rung} attempt${r.rung === 1 ? "" : "s"}${r.laa ? `, last ${r.laa}` : ", none recorded"}${
           r.org ? ` · ${r.org}` : ""
         }`,
@@ -264,34 +292,49 @@ export async function buildDigest(db: D1Db, today: string = localToday()): Promi
       db,
       "Meetings later this week",
       false,
-      `SELECT c.id, c.full_name, c.meeting_date, ifnull(c.meeting_time,'') AS t
+      `SELECT c.id, c.full_name, c.is_priority, c.meeting_date, ifnull(c.meeting_time,'') AS t
          FROM contact c
         WHERE c.status='active' AND c.meeting_date > ?
           AND c.meeting_date <= date(?, '+7 days')
-        ORDER BY c.meeting_date, c.meeting_time`,
+        ORDER BY c.meeting_date, ${MEETING_TIME_ORDER}`,
       [today, today],
       (r) => ({
-        who: String(r.full_name),
+        who: star(r) + String(r.full_name),
         detail: `${r.meeting_date}${r.t ? ` ${r.t}` : ""}`,
         href: `/contacts/${r.id}`,
       })
     )
   );
 
+  /*
+   * Calendar updates (2026-09-25). What the hourly meeting sync added or changed in the last 24 hours, so
+   * a wrong pick-up is seen the next morning rather than discovered at the meeting. Not urgent (it does
+   * not count toward "N things need you today"), but it IS content: a day whose only news is three new
+   * meetings still sends, because that is exactly the day he needs to check them.
+   */
+  const updates = await recentCalendarUpdates(db, 24).catch(() => []);
+  out.push({
+    title: "Calendar updates, last 24 hours",
+    urgent: false,
+    lines: updates.slice(0, SECTION_LIMIT).map((u) => ({
+      who: u.name,
+      detail: `${describeUpdate(u)}. Wrong? Open the record and edit or resolve it`,
+      href: `/contacts/${u.contactId}`,
+    })),
+    total: updates.length,
+  });
+
   return out.filter((s) => s.total > 0);
 }
 
-/**
- * The digest links back to the app, so it needs the app's own URL — which is specific to each
- * deployment and cannot be hardcoded in a template. Set the optional `APP_URL` var in `wrangler.jsonc`
- * (e.g. `https://your-worker.your-subdomain.workers.dev`, or your custom domain) to get clickable links;
- * without it, the digest still sends, just without a dashboard link.
+/*
+ * The app's own address, for links in an email written by a cron that has no request to read it from.
+ * Captured from signed-in requests (index.ts middleware) since Phase 3a, replacing the owner's hardcoded
+ * workers.dev URL. Blank until someone has signed in once, in which case links are left relative.
  */
-function appOrigin(env: Bindings): string {
-  return (env.APP_URL ?? "").replace(/\/+$/, "");
-}
+const origin = () => appSettings().origin ?? "";
 
-function renderHtml(sections: Section[], today: string, origin: string): string {
+function renderHtml(sections: Section[], today: string): string {
   const block = (s: Section) => `
     <h3 style="font:600 15px/1.3 system-ui,sans-serif;margin:20px 0 6px;color:${
       s.urgent ? "#b91c1c" : "#334155"
@@ -301,7 +344,7 @@ function renderHtml(sections: Section[], today: string, origin: string): string 
         .map(
           (l) => `<tr>
         <td style="padding:5px 0;font:400 14px/1.45 system-ui,sans-serif;color:#0f172a;border-bottom:1px solid #f1f5f9">
-          <a href="${origin}${l.href}" style="color:#0f172a;text-decoration:none;font-weight:600">${esc(l.who)}</a>
+          <a href="${origin()}${l.href}" style="color:#0f172a;text-decoration:none;font-weight:600">${esc(l.who)}</a>
           <span style="color:#64748b"> — ${esc(l.detail)}</span>
         </td></tr>`
         )
@@ -316,20 +359,21 @@ function renderHtml(sections: Section[], today: string, origin: string): string 
     </table>`;
 
   return `<div style="max-width:600px;margin:0 auto;padding:8px 4px">
-  <p style="font:400 13px/1.4 system-ui,sans-serif;color:#64748b;margin:0 0 2px">Practice Platform · ${esc(today)}</p>
+  <p style="font:400 13px/1.4 system-ui,sans-serif;color:#64748b;margin:0 0 2px">${esc(appSettings().appName)} · ${esc(today)}</p>
   <h2 style="font:600 19px/1.3 system-ui,sans-serif;margin:0 0 4px;color:#0f172a">What needs you today</h2>
   ${sections.map(block).join("")}
   <p style="font:400 13px/1.5 system-ui,sans-serif;color:#64748b;margin:24px 0 0;padding-top:12px;border-top:1px solid #e2e8f0">
-    ${origin ? `<a href="${origin}/" style="color:#334155">Open the dashboard</a> · <a href="${origin}/health" style="color:#334155">Turn this digest off</a><br>` : ""}
+    <a href="${origin()}/" style="color:#334155">Open the dashboard</a> ·
+    <a href="${origin()}/health" style="color:#334155">Turn this digest off</a><br>
     Sent only on weekdays, and only when something is due — no email means nothing was.
   </p>
 </div>`;
 }
 
 /** Plain text alongside the HTML, because a mail client that refuses HTML should still be readable. */
-function renderText(sections: Section[], today: string, origin: string): string {
+function renderText(sections: Section[], today: string): string {
   return [
-    `Practice Platform — ${today}`,
+    `${appSettings().appName} — ${today}`,
     "What needs you today",
     "",
     ...sections.flatMap((s) => [
@@ -338,7 +382,8 @@ function renderText(sections: Section[], today: string, origin: string): string 
       ...(s.total > s.lines.length ? [`  ...and ${s.total - s.lines.length} more`] : []),
       "",
     ]),
-    ...(origin ? [`Dashboard: ${origin}/`, `Turn this digest off: ${origin}/health`] : []),
+    `Dashboard: ${origin()}/`,
+    `Turn this digest off: ${origin()}/health`,
   ].join("\n");
 }
 
@@ -348,7 +393,7 @@ async function note(db: D1Db, outcome: string, detail: string) {
       `INSERT INTO audit_event (actor, entity, entity_id, action, before_summary, after_summary, source, correlation_id)
        VALUES (?,?,?,?,?,?,?,?)`
     )
-    .bind(ACTOR, "digest", "daily", outcome, null, detail.slice(0, 500), "digest", `digest-${Date.now()}`)
+    .bind(actor(), "digest", "daily", outcome, null, detail.slice(0, 500), "digest", `digest-${Date.now()}`)
     .run();
 }
 
@@ -364,7 +409,7 @@ export async function runDigest(
 
   if (!opts.force && !isSendHour(new Date())) {
     // The other cron of the pair. Not worth an audit row — it is the mechanism working, twice a day.
-    return { outcome: "skipped", detail: "not the send hour in Central" };
+    return { outcome: "skipped", detail: `not the send hour in ${zoneLabel()}` };
   }
 
   if (!(await isOn(db, DIGEST_ENABLED))) {
@@ -382,7 +427,7 @@ export async function runDigest(
 
   const sections = await buildDigest(db);
   const today = new Intl.DateTimeFormat("en-GB", {
-    timeZone: LOCAL_ZONE,
+    timeZone: currentZone(),
     weekday: "long",
     day: "numeric",
     month: "long",
@@ -416,7 +461,7 @@ export async function runDigest(
     body: JSON.stringify({
       message: {
         subject,
-        body: { contentType: "HTML", content: renderHtml(sections, today, appOrigin(env)) },
+        body: { contentType: "HTML", content: renderHtml(sections, today) },
         toRecipients: [{ emailAddress: { address: conn.account_upn } }],
       },
       saveToSentItems: false,
@@ -469,7 +514,7 @@ app.post("/digest/toggle", async (c) => {
      VALUES (?,?,?,?,?,?,?,?)`
   )
     .bind(
-      ACTOR,
+      actor(),
       "setting",
       DIGEST_ENABLED,
       "update",

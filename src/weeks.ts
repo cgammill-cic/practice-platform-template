@@ -1,8 +1,10 @@
+import { appSettings } from "./settings";
 // Week boundaries for the dashboard.
 //
-// Definition: weeks run Sunday–Saturday, matching how the operator thinks about a calendar — not a
-// rolling 7 days. "This Week" is today through the coming Saturday, so it shrinks as the week progresses;
-// "Next Week" is the following Sunday–Saturday, which needs to be visible by Friday.
+// Definition (confirmed with the owner 2026-07-30): weeks run Sunday–Saturday, matching how he thinks
+// about his calendar — not a rolling 7 days. "This Week" is today through the coming Saturday, so it
+// shrinks as the week progresses; "Next Week" is the following Sunday–Saturday, which is what he needs
+// visible by Friday.
 //
 // SQLite modifiers do the work: date('now','weekday 6') = the coming Saturday (today if it IS Saturday).
 // Next week therefore starts the day after that, which stays correct on every day including Sunday.
@@ -40,11 +42,12 @@ export function shiftWeek(anchor: string, n: number): string {
 }
 
 /*
- * PERIODS WIDER THAN A WEEK, for the hours report (TIME-002).
+ * PERIODS WIDER THAN A WEEK, for the hours report (TIME-002, 2026-08-19).
  *
- * The billable ("Client Delivery") time captured here feeds invoicing, and invoices are not weekly. The
- * report had only ever been able to answer a week, so a month or a quarter meant adding up four or
- * thirteen screens by hand — which is exactly the arithmetic the app exists to save the operator from.
+ * The owner, on what the hours are for: "The BIGGEST thing I will need is the 'Client Delivery' time
+ * captured because i will use that for invoicing." Invoices are not weekly. The report had only ever
+ * been able to answer a week, so a month or a quarter meant adding up four or thirteen screens by hand —
+ * which is exactly the arithmetic the app exists to stop him doing.
  *
  * MONTHS AND QUARTERS ARE CALENDAR-ALIGNED, weeks stay Sunday–Saturday. That means a month and the weeks
  * inside it do NOT sum to the same number, and they should not: a week straddling the 1st belongs to two
@@ -107,4 +110,26 @@ export function shiftPeriod(period: Period, anchor: string, n: number): string {
   const d = new Date(`${anchor}T00:00:00Z`);
   const step = period === "month" ? n : n * 3;
   return iso(utc(d.getUTCFullYear(), d.getUTCMonth() + step, 1));
+}
+
+/**
+ * Today's date in the copy's timezone, not the server's (moved here from digest.ts, 2026-09-25). SQLite's
+ * date('now') is UTC, so after 7pm Central it is already tomorrow; anything that says "today" or buckets
+ * by week in local time uses this instead. See digest.ts for the bug that introduced it.
+ *
+ * The zone is a setting since Phase 3a (settings.ts appSettings().zone, default America/Chicago), so a
+ * copy in another timezone gets its own "today" without a code change.
+ */
+export const currentZone = (): string => appSettings().zone;
+export function localToday(now: Date = new Date(), zone: string = currentZone()): string {
+  try {
+    return new Intl.DateTimeFormat("en-CA", {
+      timeZone: zone,
+      year: "numeric",
+      month: "2-digit",
+      day: "2-digit",
+    }).format(now);
+  } catch {
+    return now.toISOString().slice(0, 10);
+  }
 }

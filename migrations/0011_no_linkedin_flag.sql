@@ -6,7 +6,7 @@
 -- Without it the worklist is a list you can never finish. 61 active non-terminal contacts have no
 -- linkedin_url on prod today (counted 2026-08-11, against 97 missing across all 295 contacts — the
 -- other 36 are in terminal stages and the worklist excludes them). Some of those 61 people genuinely
--- have no profile: the importer already had to leave URLs blank where the LinkedIn connections export had no
+-- have no profile: the importer already had to leave URLs blank where the owner's Connections.csv had no
 -- match at all, and no amount of searching turns that into a URL. Each one would sit on the list
 -- forever, and a worklist with permanent residents stops being read.
 --
@@ -33,8 +33,8 @@
 --
 -- No backfill. Nothing in the data distinguishes "no profile exists" from "not searched yet" — the
 -- importer's `linkedin_match = 'ambiguous'` flag says several connections share the name, which is the
--- opposite case, and its blank-with-no-flag case says only that the connections export had no row. Guessing
--- here would silently retire contacts from the worklist that nobody has actually reviewed.
+-- opposite case, and its blank-with-no-flag case says only that Connections.csv had no row. Guessing
+-- here would silently retire contacts from the worklist that the owner has never seen.
 --
 -- Rollback: ALTER TABLE contact DROP COLUMN no_linkedin;
 --   Supported in SQLite 3.35+ and D1. Loses which contacts were marked, which is unrecoverable from the

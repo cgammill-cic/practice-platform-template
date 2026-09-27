@@ -15,17 +15,17 @@
  * says what the move actually is, and lets three commitments from one meeting have three due dates and
  * be finished on three different days.
  *
- * REL-024: the add form used a <select> listing every contact, which meant scrolling past the entire
- * contact list to reach the Due field once it was rendered. Replaced with a type-ahead input backed by
- * a datalist — the same pattern the contact form already uses for organizations. Names are resolved
- * server-side, and an ambiguous name is refused with the candidates listed rather than guessed at,
- * because attaching a commitment to the wrong person is worse than making you disambiguate.
+ * REL-024: the add form used a <select> listing every contact, which meant scrolling past all 285 to
+ * reach the Due field (the owner, 2026-07-31, on seeing it rendered). Replaced with a type-ahead input
+ * backed by a datalist — the same pattern the contact form already uses for organizations. Names are
+ * resolved server-side, and an ambiguous name is refused with the candidates listed rather than guessed
+ * at, because attaching a commitment to the wrong person is worse than making you disambiguate.
  *
- * CORRECTION, 2026-08-01. An earlier version of this comment asserted the contact list already had
- * duplicate names in production. Checked against production: it did not. The refusal itself stays —
- * full_name has no unique constraint, so two same-named contacts remain creatable, and refusing beats
- * guessing on the day it happens. But it is a guard against a possible state, not a description of the
- * current one.
+ * CORRECTION, 2026-08-01. That last sentence used to read "this app has two contacts sharing one name, twice over". Checked against production: 285 contacts, 285 distinct names, no duplicate of any name.
+ * Each of those names belonged to exactly one contact (ids 240 and 264). The claim was false, and had been
+ * repeated in templates.ts as well. The refusal itself stays — full_name has no unique constraint, so
+ * two same-named contacts remain creatable, and refusing beats guessing on the day it happens. But it
+ * is a guard against a possible state, not a description of the current one.
  *
  * Other design decisions:
  *   - An item with no due date is NOT hidden. It sorts to the top of the open list, the same inversion
@@ -35,11 +35,11 @@
  */
 
 import { Hono } from "hono";
-import { esc, followUpPill, layout } from "./views";
-import type { Bindings, D1Db } from "./types";
+import { esc, followUpDotClass, followUpPill, initials, layout, priorityBadge } from "./views";
+import { PRIORITY_FIRST_ORDER, type Bindings, type D1Db } from "./types";
+import { actor } from "./auth";
 
 const app = new Hono<{ Bindings: Bindings }>();
-const ACTOR = "operator";
 const today = () => new Date().toISOString().slice(0, 10);
 
 export interface ActionRow {
@@ -52,12 +52,14 @@ export interface ActionRow {
   done_at: string | null;
   created_at: string;
   full_name: string;
+  /** Migration 0029: the contact is in the priority inner circle, so the item sorts first. */
+  is_priority: number;
   organization_name: string | null;
   interaction_date: string | null;
   interaction_subject: string | null;
 }
 
-const SELECT = `SELECT a.*, c.full_name, o.name AS organization_name,
+const SELECT = `SELECT a.*, c.full_name, c.is_priority, o.name AS organization_name,
     i.date AS interaction_date, i.subject AS interaction_subject
   FROM action_item a
   JOIN contact c ON c.id = a.contact_id
@@ -67,7 +69,7 @@ const SELECT = `SELECT a.*, c.full_name, o.name AS organization_name,
 /** Open items, undated first, then soonest due. Used by the dashboard and the list page. */
 export async function openActions(db: D1Db, limit = 200): Promise<ActionRow[]> {
   const { results } = await db
-    .prepare(`${SELECT} WHERE a.done = 0 ORDER BY (a.due_date IS NOT NULL), a.due_date, a.id LIMIT ?`)
+    .prepare(`${SELECT} WHERE a.done = 0 ORDER BY ${PRIORITY_FIRST_ORDER}, (a.due_date IS NOT NULL), a.due_date, a.id LIMIT ?`)
     .bind(limit)
     .all<ActionRow>();
   return results;
@@ -113,7 +115,7 @@ async function audit(
     .prepare(
       "INSERT INTO audit_event (actor, entity, entity_id, action, before_summary, after_summary, source, correlation_id) VALUES (?,?,?,?,?,?,'app',?)"
     )
-    .bind(ACTOR, "action_item", String(id), action, before ?? null, after, contactId ? `contact-${contactId}` : null)
+    .bind(actor(), "action_item", String(id), action, before ?? null, after, contactId ? `contact-${contactId}` : null)
     .run();
 }
 
@@ -171,33 +173,42 @@ export function actionRow(a: ActionRow, opts: { showContact?: boolean } = {}): s
   const provenance = a.interaction_date
     ? `from the ${esc(a.interaction_date)} ${esc(a.interaction_subject ?? "interaction")} · <a href="/contacts/${a.contact_id}/history">history</a>`
     : "no linked interaction";
-  return `<tr${overdue ? ' style="background:#fef2f2"' : undated ? ' style="background:#fffbeb"' : ""}>
-    <td>
-      <b>${esc(a.description)}</b>
-      <div class="meta">
-        ${
-          showContact
-            ? `<a href="/contacts/${a.contact_id}">${esc(a.full_name)}</a>${a.organization_name ? ` · ${esc(a.organization_name)}` : ""} · ${provenance}`
-            : provenance
-        }
-      </div>
-    </td>
-    <td data-label="${a.done ? "Completed" : "Due"}">${
-      a.done
-        ? `<span class="pill green">done${a.done_at ? ` ${esc(a.done_at)}` : ", date unknown"}</span>`
-        : a.due_date
-          ? followUpPill(a.due_date)
-          : '<span class="pill red">no due date</span>'
-    }</td>
-    <td style="text-align:right">
+  /*
+   * Phase 4, 2026-09-14: .listrow in place of the old <tr>, matching the dashboard's actionBlock().
+   * The row tint used to be a literal hex background (#fef2f2/#fffbeb) that never adapted to the dark
+   * theme — replaced with the theme-aware tint tokens every other overdue/undated indicator uses.
+   */
+  return `<div class="listrow"${
+    overdue ? ' style="background:var(--red-tint)"' : undated ? ' style="background:var(--amber-tint)"' : ""
+  }>
+    <span class="dot ${a.due_date ? followUpDotClass(a.due_date) : "red"}"></span>
+    ${showContact ? `<span class="avatar">${esc(initials(a.full_name))}</span>` : ""}
+    <div class="listrow-main">
+      <div class="listrow-name">${esc(a.description)}</div>
+      <div class="meta">${
+        showContact
+          ? `<a href="/contacts/${a.contact_id}">${esc(a.full_name)}</a> ${priorityBadge(a)}${a.organization_name ? ` · ${esc(a.organization_name)}` : ""} · ${provenance}`
+          : provenance
+      }</div>
+    </div>
+    <div class="listrow-meta">
       ${
         a.done
-          ? `<form method="post" action="/actions/${a.id}/reopen" style="display:inline"><button class="secondary tiny" type="submit">Reopen</button></form>`
-          : `<form method="post" action="/actions/${a.id}/done" style="display:inline"><button class="tiny" type="submit">Done</button></form>`
+          ? `<span class="pill green">done${a.done_at ? ` ${esc(a.done_at)}` : ", date unknown"}</span>`
+          : a.due_date
+            ? followUpPill(a.due_date)
+            : '<span class="pill red">no due date</span>'
       }
-      <form method="post" action="/actions/${a.id}/delete" style="display:inline"><button class="secondary tiny" type="submit">Delete</button></form>
-    </td>
-  </tr>`;
+      <div>
+        ${
+          a.done
+            ? `<form method="post" action="/actions/${a.id}/reopen" style="display:inline"><button class="secondary tiny" type="submit">Reopen</button></form>`
+            : `<form method="post" action="/actions/${a.id}/done" style="display:inline"><button class="tiny" type="submit">Done</button></form>`
+        }
+        <form method="post" action="/actions/${a.id}/delete" style="display:inline"><button class="secondary tiny" type="submit">Delete</button></form>
+      </div>
+    </div>
+  </div>`;
 }
 
 /** Compact block for the dashboard — no controls beyond Done, links through to the full list. */
@@ -206,18 +217,25 @@ export function actionBlock(rows: ActionRow[]): string {
     return '<div class="empty">No open action items. Anything you promised in a meeting belongs here.</div>';
   const overdue = rows.filter((a) => a.due_date && a.due_date < today()).length;
   const undated = rows.filter((a) => !a.due_date).length;
-  return `<table><tbody>${rows
+  return `<div class="list">${rows
     .slice(0, 10)
     .map(
-      (a) => `<tr>
-      <td><b>${esc(a.description)}</b><div class="meta"><a href="/contacts/${a.contact_id}">${esc(a.full_name)}</a>${
-        a.interaction_date ? ` · from ${esc(a.interaction_date)}` : ""
-      }</div></td>
-      <td style="text-align:right" data-label="Due">${a.due_date ? followUpPill(a.due_date) : '<span class="pill red">no due date</span>'}
-        <form method="post" action="/actions/${a.id}/done" style="display:inline;margin-left:6px"><button class="tiny" type="submit">Done</button></form></td>
-    </tr>`
+      (a) => `<div class="listrow">
+      <span class="dot ${a.due_date ? followUpDotClass(a.due_date) : "red"}"></span>
+      <span class="avatar">${esc(initials(a.full_name))}</span>
+      <div class="listrow-main">
+        <div class="listrow-name">${esc(a.description)}</div>
+        <div class="meta"><a href="/contacts/${a.contact_id}">${esc(a.full_name)}</a>${
+          a.interaction_date ? ` · from ${esc(a.interaction_date)}` : ""
+        }</div>
+      </div>
+      <div class="listrow-meta">
+        ${a.due_date ? followUpPill(a.due_date) : '<span class="pill red">no due date</span>'}
+        <form method="post" action="/actions/${a.id}/done" style="display:inline"><button class="tiny" type="submit">Done</button></form>
+      </div>
+    </div>`
     )
-    .join("")}</tbody></table>
+    .join("")}</div>
   <p class="meta" style="margin-top:8px">${rows.length} open${
     rows.length > 10 ? `, showing 10 — <a href="/actions">see all</a>` : ""
   }${overdue ? ` · <b>${overdue} overdue</b>` : ""}${undated ? ` · ${undated} with no due date` : ""}</p>`;
@@ -237,7 +255,7 @@ export function contactActionBlock(contactId: number, rows: ActionRow[]): string
   const open = rows.filter((a) => !a.done);
   const done = rows.filter((a) => a.done);
   const table = (list: ActionRow[]) =>
-    `<table><tbody>${list.map((a) => actionRow(a, { showContact: false })).join("")}</tbody></table>`;
+    `<div class="list">${list.map((a) => actionRow(a, { showContact: false })).join("")}</div>`;
 
   return `${
     open.length
@@ -283,7 +301,7 @@ app.get("/actions", async (c) => {
     show === "all"
       ? (
           await c.env.DB.prepare(
-            `${SELECT} ORDER BY a.done, (a.due_date IS NOT NULL), a.due_date, a.id DESC LIMIT 300`
+            `${SELECT} ORDER BY a.done, ${PRIORITY_FIRST_ORDER}, (a.due_date IS NOT NULL), a.due_date, a.id DESC LIMIT 300`
           ).all<ActionRow>()
         ).results
       : await openActions(c.env.DB);
@@ -308,7 +326,7 @@ app.get("/actions", async (c) => {
   const isWarn = flash === "noname" || flash === "nomatch" || flash === "ambiguous";
 
   return c.html(
-    layout({
+    layout({ c,
       title: "Action Items",
       body: `<main>
   ${flash && flashMap[flash] ? `<div class="flash ${isWarn ? "warn" : "ok"}">${esc(flashMap[flash])}</div>` : ""}
@@ -323,7 +341,7 @@ app.get("/actions", async (c) => {
     <input type="text" name="description" placeholder="e.g. Send the 10-day agent deployment overview" required ${prefill ? "" : "autofocus"}>
     <div class="row">
       <div><label>For whom <span class="hint">start typing a name</span></label>
-        <input type="text" name="contact" list="contactnames" value="${esc(prefill)}" placeholder="e.g. Edgar Huerta" required ${prefill ? "autofocus" : ""}>
+        <input type="text" name="contact" list="contactnames" value="${esc(prefill)}" placeholder="e.g. Jane Smith" required ${prefill ? "autofocus" : ""}>
         <datalist id="contactnames">${names.results
           .map((k) => `<option value="${esc(k.full_name)}">${esc(k.organization_name ?? "")}</option>`)
           .join("")}</datalist></div>
@@ -335,7 +353,7 @@ app.get("/actions", async (c) => {
 
   ${
     rows.length
-      ? `<table><thead><tr><th>Commitment</th><th>Due</th><th></th></tr></thead><tbody>${rows.map((a) => actionRow(a)).join("")}</tbody></table>`
+      ? `<div class="list">${rows.map((a) => actionRow(a)).join("")}</div>`
       : `<div class="card empty">${
           show === "all" ? "No action items recorded yet." : 'Nothing open. <a href="/actions?show=all">See completed items</a>'
         }</div>`

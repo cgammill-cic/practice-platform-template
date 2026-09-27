@@ -9,17 +9,20 @@
 // behaviour then tested as "no events", which is indistinguishable from "working" unless something is
 // checking. A Worker cannot read migrations/ at runtime, so the expectation has to be compiled in.
 //
-// Generated from 26 migration files, 0001_initial_schema.sql … 0026_activity_table.sql.
+// Generated from 35 migration files, 0001_initial_schema.sql … 0035_commitment.sql.
 
 export const EXPECTED_TABLES: readonly string[] = [
   "action_item",
   "activity",
   "app_setting",
+  "app_user",
   "audit_event",
   "backup_run",
+  "commitment",
   "contact",
   "contact_stage_event",
   "contact_tag",
+  "email_import_address_ignore",
   "email_import_exclusion",
   "engagement",
   "engagement_contact",
@@ -29,6 +32,10 @@ export const EXPECTED_TABLES: readonly string[] = [
   "ms_connection",
   "organization",
   "organization_not_duplicate",
+  "outreach_item",
+  "outreach_run",
+  "outreach_schedule",
+  "password_reset",
   "tag",
   "time_entry",
 ];
@@ -38,6 +45,9 @@ export const EXPECTED_INDEXES: readonly string[] = [
   "idx_action_interaction",
   "idx_action_open",
   "idx_audit_ts",
+  "idx_commitment_contact",
+  "idx_commitment_engagement",
+  "idx_commitment_open",
   "idx_contact_attempt",
   "idx_contact_email_work",
   "idx_contact_meeting_date",
@@ -55,6 +65,11 @@ export const EXPECTED_INDEXES: readonly string[] = [
   "idx_interaction_format",
   "idx_org_not_dupe_b",
   "idx_organization_name",
+  "idx_outreach_item_active",
+  "idx_outreach_item_status",
+  "idx_outreach_run_started",
+  "idx_outreach_schedule_due",
+  "idx_password_reset_user",
   "idx_stage_event_contact",
   "idx_stage_event_to",
   "idx_stage_event_when",
@@ -74,7 +89,7 @@ export const EXPECTED_TRIGGERS: readonly string[] = [
 ];
 
 /** How many migration files this was generated from, for the health page to quote. */
-export const MIGRATION_COUNT = 26;
+export const MIGRATION_COUNT = 35;
 
 /** Which migration last created each object, for the health page to name in its remedy. */
 export const OBJECT_SOURCE: Readonly<Record<string, string>> = {
@@ -82,6 +97,9 @@ export const OBJECT_SOURCE: Readonly<Record<string, string>> = {
   "index:idx_action_interaction": "0006_action_items.sql",
   "index:idx_action_open": "0006_action_items.sql",
   "index:idx_audit_ts": "0001_initial_schema.sql",
+  "index:idx_commitment_contact": "0035_commitment.sql",
+  "index:idx_commitment_engagement": "0035_commitment.sql",
+  "index:idx_commitment_open": "0035_commitment.sql",
   "index:idx_contact_attempt": "0009_pray_stage.sql",
   "index:idx_contact_email_work": "0009_pray_stage.sql",
   "index:idx_contact_meeting_date": "0009_pray_stage.sql",
@@ -99,6 +117,11 @@ export const OBJECT_SOURCE: Readonly<Record<string, string>> = {
   "index:idx_interaction_format": "0014_interaction_format.sql",
   "index:idx_org_not_dupe_b": "0023_org_not_duplicate.sql",
   "index:idx_organization_name": "0001_initial_schema.sql",
+  "index:idx_outreach_item_active": "0032_outreach.sql",
+  "index:idx_outreach_item_status": "0032_outreach.sql",
+  "index:idx_outreach_run_started": "0032_outreach.sql",
+  "index:idx_outreach_schedule_due": "0032_outreach.sql",
+  "index:idx_password_reset_user": "0034_password_reset.sql",
   "index:idx_stage_event_contact": "0020_contact_stage_event.sql",
   "index:idx_stage_event_to": "0020_contact_stage_event.sql",
   "index:idx_stage_event_when": "0020_contact_stage_event.sql",
@@ -109,11 +132,14 @@ export const OBJECT_SOURCE: Readonly<Record<string, string>> = {
   "table:action_item": "0006_action_items.sql",
   "table:activity": "0026_activity_table.sql",
   "table:app_setting": "0021_app_setting.sql",
+  "table:app_user": "0031_app_user.sql",
   "table:audit_event": "0001_initial_schema.sql",
   "table:backup_run": "0001_initial_schema.sql",
+  "table:commitment": "0035_commitment.sql",
   "table:contact": "0009_pray_stage.sql",
   "table:contact_stage_event": "0020_contact_stage_event.sql",
   "table:contact_tag": "0001_initial_schema.sql",
+  "table:email_import_address_ignore": "0028_email_import_address_ignore.sql",
   "table:email_import_exclusion": "0024_email_import_review.sql",
   "table:engagement": "0022_pursuit.sql",
   "table:engagement_contact": "0022_pursuit.sql",
@@ -123,6 +149,10 @@ export const OBJECT_SOURCE: Readonly<Record<string, string>> = {
   "table:ms_connection": "0016_ms_connection.sql",
   "table:organization": "0001_initial_schema.sql",
   "table:organization_not_duplicate": "0023_org_not_duplicate.sql",
+  "table:outreach_item": "0032_outreach.sql",
+  "table:outreach_run": "0032_outreach.sql",
+  "table:outreach_schedule": "0032_outreach.sql",
+  "table:password_reset": "0034_password_reset.sql",
   "table:tag": "0001_initial_schema.sql",
   "table:time_entry": "0026_activity_table.sql",
   "trigger:contact_stage_change": "0020_contact_stage_event.sql",

@@ -1,18 +1,20 @@
 import { Hono } from "hono";
 import { getCookie, setCookie, deleteCookie } from "hono/cookie";
 import actionsApp, { actionBlock, openActions } from "./actions";
+import commitmentsApp from "./commitments";
 import auditApp from "./audit";
 import escalationApp, { chaseBlock, chaseList } from "./escalation";
 import { runBackup, recordBackupFailure, backupStatus } from "./backup";
 import contactList from "./contactList";
 import contacts from "./contacts";
 import digestApp, { DIGEST_CRONS, runDigest } from "./digest";
+import { MEETING_SYNC_CRON, describeUpdate, recentCalendarUpdates, runMeetingSync } from "./meetingsync";
 import engagementsApp from "./engagements";
 import orgDupesApp from "./orgdupes";
 import organizationsApp from "./organizations";
 import pursuitsApp, { pursuitsNeedingAttention } from "./pursuits";
 import timeApp, { entriesForWeek } from "./time";
-import { MANIFEST, iconBytes, markBytes } from "./icons";
+import { iconBytes, manifest, markBytes } from "./icons";
 import exportsApp from "./exports";
 import health from "./health";
 import importer from "./importer";
@@ -20,6 +22,9 @@ import bulkUpdateApp from "./bulkupdate";
 import linkedinApp, { missingLinkedInCount } from "./linkedin";
 import calImportApp from "./calimport";
 import mailImportApp from "./mailimport";
+import meetingsApp from "./meetings";
+import analyticsApp from "./analytics";
+import pricingApp from "./pricing";
 import feedbackApp from "./feedback";
 import activitiesApp, { loadActivities, nonWorkNames } from "./activities";
 import msGraphApp from "./msgraph";
@@ -27,39 +32,88 @@ import pipelineApp from "./pipeline";
 import referralsApp from "./referrals";
 import templatesApp from "./templates";
 import { vocabularyStatus } from "./vocabulary";
-import { esc, followUpPill, formatTime, layout } from "./views";
+import { esc, followUpDotClass, followUpPill, formatTime, initials, layout, logoV, priorityBadge, SECTION_ICONS } from "./views";
 import {
   ACTIVE_STAGES,
   ENGAGEMENT_STATUSES,
   MEETING_OUTCOMES,
   labelFor,
+  MEETING_TIME_ORDER,
+  PRIORITY_FIRST_ORDER,
   TERMINAL_STAGES,
   stageLabel,
   type Bindings,
   type Contact,
 } from "./types";
 import { NEXT_WEEK_END, NEXT_WEEK_START, THIS_WEEK_END, weekBounds } from "./weeks";
+import {
+  LOCKOUT_AFTER,
+  LOCKOUT_MINUTES,
+  OWNER_PASSPHRASE,
+  PBKDF2_ITERATIONS,
+  SESSION_DAYS,
+  SYSTEM,
+  clearPassphraseFailures,
+  identityOf,
+  isAdmin,
+  isLocked,
+  makeSessionToken,
+  notePassphraseFailure,
+  parseSessionToken,
+  passphraseBlocked,
+  runAs,
+  safeEqual,
+  sha256,
+  userByEmail,
+  userById,
+  adminOnlyPath,
+  verifyPassword,
+} from "./auth";
+import usersApp from "./users";
+import accessApp, { hasAccounts } from "./access";
+import settingsApp from "./settingsPage";
+import { SETTING_KEYS, appSettings, loadAppSettings, saveTextSetting } from "./settings";
+import { isSchemaBehind, refreshPendingCount } from "./migrate";
+import outreachApp, { BATCH_CONDITION, BATCH_ORDER, OUTREACH_CRON, activeOutreach, runOutreachTick } from "./outreach";
 
 const app = new Hono<{ Bindings: Bindings }>();
+
+/*
+ * Per-copy settings (Phase 3a) are loaded before anything renders, public pages included: the sign-in
+ * page shows the firm's name and logo too. Cached per isolate for a minute (settings.ts), so this is one
+ * small query a minute, not one per request.
+ */
+app.use("*", async (c, next) => {
+  const s = await loadAppSettings(c.env.DB);
+  await refreshPendingCount(c.env.DB); // Phase 3b: the admin "updates waiting" banner, cached per isolate
+  /*
+   * The app's own address, for links in the emailed digest. Recorded ONCE, from the first request that
+   * finds none, and editable on Settings after that: capturing it on every request would let a preview
+   * deployment's URL overwrite the real one. localhost is never recorded.
+   */
+  if (!s.origin) {
+    const origin = new URL(c.req.url).origin;
+    if (origin.startsWith("https://")) await saveTextSetting(c.env.DB, SETTING_KEYS.origin, origin).catch(() => undefined);
+  }
+  return next();
+});
 
 const COOKIE = "pp_session";
 /** Which dashboard sections are collapsed (#70). Display state only — never read for anything else. */
 const DASH_COOKIE = "pp_dash_closed";
-/*
- * How long a sign-in lasts. Thirty days, decided 2026-08-04 (UX-001, #56), up from seven.
- *
- * Seven days meant re-typing the passphrase weekly, and on a phone that is the friction that stops you
- * opening the app in the ninety seconds after a meeting — which is the whole reason UX-001 exists. The
- * cost is the honest one: a lost phone holds a live session for up to thirty days rather than seven.
- *
- * What actually contains that risk is not the number: rotating SESSION_SECRET invalidates every session
- * everywhere, immediately, and it is one field in the Cloudflare dashboard (docs/runbook.md → Secrets).
- * A stolen device is answered in thirty seconds by rotating, not by having chosen a shorter expiry a
- * month earlier. The cookie remains httpOnly, Secure and SameSite=Lax, and the token is HMAC-signed
- * with its own expiry inside, so lengthening this does not weaken anything else.
+/**
+ * The chosen theme (Command Console, 2026-09-14). Unlike DASH_COOKIE, nothing ever needs to read this
+ * client-side, so it stays server-set and httpOnly like the session cookie — there's no reason to
+ * weaken it just because it carries no security weight.
  */
-const SESSION_DAYS = 30;
-const enc = new TextEncoder();
+const THEME_COOKIE = "pp_theme";
+/*
+ * How long a sign-in lasts: SESSION_DAYS (30), the owner's decision 2026-08-04 (UX-001, #56), now defined
+ * in auth.ts beside the token format. Seven days meant re-typing the passphrase weekly, and on a phone
+ * that is the friction that stops you opening the app in the ninety seconds after a meeting. What
+ * contains a lost device is not the number: disabling the account (Users) or changing its password ends
+ * its sessions on the next request, and rotating SESSION_SECRET still ends every session everywhere.
+ */
 
 /**
  * How far ahead "Upcoming Follow-Ups" looks (REL-004, #14). Fourteen days, from the issue itself.
@@ -70,85 +124,109 @@ const enc = new TextEncoder();
  */
 const UPCOMING_FOLLOW_UP_DAYS = 14;
 
-async function hmac(secret: string, data: string): Promise<string> {
-  const key = await crypto.subtle.importKey(
-    "raw",
-    enc.encode(secret),
-    { name: "HMAC", hash: "SHA-256" },
-    false,
-    ["sign"]
-  );
-  const sig = await crypto.subtle.sign("HMAC", key, enc.encode(data));
-  return btoa(String.fromCharCode(...new Uint8Array(sig)))
-    .replace(/\+/g, "-")
-    .replace(/\//g, "_")
-    .replace(/=+$/, "");
-}
+const clientIp = (c: { req: { header(n: string): string | undefined } }) => c.req.header("cf-connecting-ip") ?? "local";
+const setSessionCookie = (c: Parameters<typeof setCookie>[0], token: string) =>
+  setCookie(c, COOKIE, token, { httpOnly: true, secure: true, sameSite: "Lax", path: "/", maxAge: SESSION_DAYS * 86400 });
 
-async function sha256(data: string): Promise<Uint8Array> {
-  return new Uint8Array(await crypto.subtle.digest("SHA-256", enc.encode(data)));
-}
+/** SQLite's datetime('now') format, for comparing against locked_until. */
+const sqlNow = () => new Date().toISOString().slice(0, 19).replace("T", " ");
 
-/** Constant-time comparison of byte arrays (lengths equalized via hashing first). */
-function safeEqual(a: Uint8Array, b: Uint8Array): boolean {
-  if (a.length !== b.length) return false;
-  let diff = 0;
-  for (let i = 0; i < a.length; i++) diff |= a[i] ^ b[i];
-  return diff === 0;
-}
-
-async function makeToken(secret: string): Promise<string> {
-  const expires = String(Date.now() + SESSION_DAYS * 86400_000);
-  return `${expires}.${await hmac(secret, expires)}`;
-}
-
-async function isAuthed(token: string | undefined, secret: string): Promise<boolean> {
-  if (!token) return false;
-  const dot = token.indexOf(".");
-  if (dot < 1) return false;
-  const expires = token.slice(0, dot);
-  const sig = token.slice(dot + 1);
-  if (!/^\d+$/.test(expires) || Number(expires) < Date.now()) return false;
-  return safeEqual(enc.encode(sig), enc.encode(await hmac(secret, expires)));
-}
-
-const loginPage = (error = "") =>
+/**
+ * Sign-in (AUTH-001, #94, 2026-09-25): email and password for a named account, with the owner
+ * passphrase kept underneath as break-glass. The passphrase is its own small form rather than a mode
+ * switch, so it stays one click away on the day an account problem makes it the only way in.
+ */
+const loginPage = (c: Parameters<typeof layout>[0]["c"], error = "", email = "", notice = "") =>
   layout({
     title: "Sign In",
     nav: false,
-    body: `<form class="card" method="post" action="/login" style="max-width:380px;margin:80px auto">
-  <!-- The sign-in page is the one screen with no content of its own, so the mark gets room here that it
-       does not get in the header. Still the mark alone, not a full wordmark — see icons.ts. -->
-  <img src="/logo.png" alt="" width="105" height="48" style="display:block;margin:0 auto 14px">
-  <h1 style="text-align:center">Practice Platform</h1>
+    c,
+    body: `<div style="max-width:380px;margin:64px auto">
+  <form class="card" method="post" action="/login">
+  <img src="/logo.png${logoV()}" alt="" width="105" height="48" style="display:block;margin:0 auto 14px;object-fit:contain">
+  <h1 style="text-align:center">${esc(appSettings().appName)}</h1>
+  ${notice ? `<p class="flash ok">${esc(notice)}</p>` : ""}
   ${error ? `<p class="flash warn">${esc(error)}</p>` : ""}
-  <label>Passphrase</label>
-  <input type="password" name="passphrase" autofocus autocomplete="current-password">
+  <label for="login-email">Email</label>
+  <input type="email" id="login-email" name="email" value="${esc(email)}" autocomplete="username" ${email ? "" : "autofocus"} required>
+  <label for="login-password">Password</label>
+  <input type="password" id="login-password" name="password" autocomplete="current-password" ${email ? "autofocus" : ""} required>
   <div class="actions"><button type="submit" style="width:100%">Sign In</button></div>
-</form>`,
+  <p class="meta" style="margin:10px 0 0;text-align:center"><a href="/forgot">Forgot password?</a></p>
+  </form>
+  <details class="card" style="margin-top:14px">
+    <summary class="meta" style="cursor:pointer">Sign in with the owner passphrase</summary>
+    <form method="post" action="/login" style="margin-top:10px">
+      <label for="login-passphrase">Owner passphrase</label>
+      <input type="password" id="login-passphrase" name="passphrase" autocomplete="off" required>
+      <div class="actions"><button type="submit" class="secondary" style="width:100%">Sign In</button></div>
+      <p class="meta" style="margin:8px 0 0">For the account owner, when a named account can't be used. It signs in with full rights and is recorded as "owner-passphrase" in the audit trail.</p>
+    </form>
+  </details>
+</div>`,
   });
 
-app.get("/login", (c) => c.html(loginPage()));
+// A brand-new copy has no accounts yet: first-run setup instead (access.ts, Phase 3c).
+app.get("/login", async (c) => {
+  if (!(await hasAccounts(c.env.DB))) return c.redirect("/setup");
+  const notice = c.req.query("flash") === "reset" ? "Password changed. Sign in with the new one." : "";
+  return c.html(loginPage(c, "", "", notice));
+});
 
 app.post("/login", async (c) => {
   const form = await c.req.parseBody();
-  const supplied = typeof form.passphrase === "string" ? form.passphrase : "";
-  const ok = safeEqual(await sha256(supplied), await sha256(c.env.APP_PASSWORD));
-  if (!ok) return c.html(loginPage("That passphrase is not correct."), 401);
-  setCookie(c, COOKIE, await makeToken(c.env.SESSION_SECRET), {
-    httpOnly: true,
-    secure: true,
-    sameSite: "Lax",
-    path: "/",
-    maxAge: SESSION_DAYS * 86400,
-  });
-  return c.redirect("/");
+  const ip = clientIp(c);
+
+  // Break-glass: the owner passphrase (APP_PASSWORD).
+  if (typeof form.passphrase === "string") {
+    if (passphraseBlocked(ip))
+      return c.html(loginPage(c, `Too many attempts. Wait ${LOCKOUT_MINUTES} minutes and try again.`), 429);
+    const ok = safeEqual(await sha256(form.passphrase), await sha256(c.env.APP_PASSWORD));
+    if (!ok) {
+      notePassphraseFailure(ip);
+      return c.html(loginPage(c, "That passphrase is not correct."), 401);
+    }
+    clearPassphraseFailures(ip);
+    setSessionCookie(c, await makeSessionToken(c.env.SESSION_SECRET, 0, 0));
+    return c.redirect("/");
+  }
+
+  // A named account. One message for every failure, so the page never reveals which emails exist.
+  const email = typeof form.email === "string" ? form.email.trim() : "";
+  const password = typeof form.password === "string" ? form.password : "";
+  const nope = "That email and password don't match an active account.";
+  const u = email ? await userByEmail(c.env.DB, email) : null;
+  if (u && isLocked(u, sqlNow()))
+    return c.html(loginPage(c, `Too many failed attempts. Try again in ${LOCKOUT_MINUTES} minutes.`, email), 429);
+  // Hash even when there is no such account, so the response time doesn't reveal it either.
+  const ok = u
+    ? await verifyPassword(password, u.pw_hash, u.pw_salt, u.pw_iterations)
+    : (await verifyPassword(password, "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA", "AAAAAAAAAAAAAAAAAAAAAA", PBKDF2_ITERATIONS), false);
+  if (!u || !ok || u.status !== "active") {
+    if (u && !ok)
+      await c.env.DB.prepare(
+        `UPDATE app_user SET failed_logins = failed_logins + 1,
+           locked_until = CASE WHEN failed_logins + 1 >= ? THEN datetime('now', '+${LOCKOUT_MINUTES} minutes') ELSE locked_until END
+         WHERE id = ?`
+      )
+        .bind(LOCKOUT_AFTER, u.id)
+        .run();
+    return c.html(loginPage(c, nope, email), 401);
+  }
+  await c.env.DB.prepare(
+    "UPDATE app_user SET failed_logins = 0, locked_until = NULL, last_login_at = datetime('now') WHERE id = ?"
+  )
+    .bind(u.id)
+    .run();
+  setSessionCookie(c, await makeSessionToken(c.env.SESSION_SECRET, u.id, u.session_version));
+  return c.redirect(u.must_change_pw ? "/account" : "/");
 });
 
 app.get("/logout", (c) => {
   deleteCookie(c, COOKIE, { path: "/" });
   return c.redirect("/login");
 });
+
 
 /*
  * Home Screen assets (UX-001, #56). Registered ABOVE the auth middleware on purpose — these three
@@ -157,80 +235,197 @@ app.get("/logout", (c) => {
  * They have to be. iOS fetches the manifest and the icon while installing a Home Screen shortcut, and
  * those requests do not reliably carry the session cookie; behind auth they would redirect to /login,
  * and the install would silently fall back to a screenshot icon with no error anywhere. Nothing here is
- * data — an app name, two colours and a public logo.
+ * data — an app name, two colours and the firm's own public logo.
  *
  * The icon is served at both paths rather than redirected: iOS asks for /apple-touch-icon.png at the
  * site root on its own, whether or not the link tag exists, and a 301 there is one more thing that can
  * behave differently between iOS versions for no gain.
  */
-const iconResponse = () =>
+/*
+ * Phase 3a: each image is the copy's own upload (R2 brand/, set on Settings) when there is one, else the
+ * neutral built-in (icons.ts). URLs carry ?v=<upload stamp> wherever the app links them, so a new upload
+ * shows at once despite the week-long cache; iOS still caches Home Screen icons until re-added.
+ */
+async function brandImage(env: Bindings, key: "icon" | "logo"): Promise<Response> {
+  const s = appSettings();
+  const stamp = key === "icon" ? (s.icon ?? s.logo) : s.logo;
+  const object = stamp ? await env.BACKUPS.get(key === "icon" && !s.icon ? "brand/logo.png" : `brand/${key}.png`).catch(() => null) : null;
   // .buffer, cast: the Workers Response accepts an ArrayBuffer, and the DOM lib's BodyInit does not
   // include the ArrayBufferLike-parameterised Uint8Array that TS 5.7 now infers. The bytes are the same.
-  new Response(iconBytes().buffer as ArrayBuffer, {
-    headers: {
-      "content-type": "image/png",
-      // A week. The icon changes when the logo changes, which is not often, and iOS caches Home Screen
-      // icons aggressively anyway — after replacing it, the shortcut has to be re-added to see the new one.
-      "cache-control": "public, max-age=604800",
-    },
-  });
-app.get("/icon.png", () => iconResponse());
-app.get("/apple-touch-icon.png", () => iconResponse());
+  const body = object ? await object.arrayBuffer() : ((key === "icon" ? iconBytes() : markBytes()).buffer as ArrayBuffer);
+  return new Response(body, { headers: { "content-type": "image/png", "cache-control": "public, max-age=604800" } });
+}
+app.get("/icon.png", (c) => brandImage(c.env, "icon"));
+app.get("/apple-touch-icon.png", (c) => brandImage(c.env, "icon"));
 /*
  * The header mark (2026-08-05). Public for the same reason and with less at stake: it is on every page
  * including /login, which is served before anyone has a session, so behind auth it would be a broken
- * image on the one screen a stranger can reach. It is a transparent-background crop of the same logo.
+ * image on the one screen a stranger can reach.
  */
-app.get("/logo.png", () =>
-  new Response(markBytes().buffer as ArrayBuffer, {
-    headers: { "content-type": "image/png", "cache-control": "public, max-age=604800" },
-  })
-);
+app.get("/logo.png", (c) => brandImage(c.env, "logo"));
 app.get("/manifest.webmanifest", () =>
-  new Response(JSON.stringify(MANIFEST), {
+  new Response(JSON.stringify(manifest(appSettings())), {
     headers: { "content-type": "application/manifest+json", "cache-control": "public, max-age=3600" },
   })
 );
 
-// Everything below requires a valid session.
+// First-run setup, Forgot password and reset links (Phase 3c): public by nature.
+app.route("/", accessApp);
+
+// Everything below requires a valid session. The request then runs AS that identity (auth.ts runAs),
+// which is what every audit write records through actor().
 app.use("*", async (c, next) => {
-  if (await isAuthed(getCookie(c, COOKIE), c.env.SESSION_SECRET)) return next();
-  return c.redirect("/login");
+  const session = await parseSessionToken(getCookie(c, COOKIE), c.env.SESSION_SECRET);
+  if (!session) return c.redirect("/login");
+  let who = OWNER_PASSPHRASE;
+  let mustChange = false;
+  if (session.kind === "user") {
+    const u = await userById(c.env.DB, session.userId);
+    // A disabled account, or a token issued before a password change or reset, is signed out here.
+    if (!u || u.status !== "active" || u.session_version !== session.version) {
+      deleteCookie(c, COOKIE, { path: "/" });
+      return c.redirect("/login");
+    }
+    who = identityOf(u);
+    mustChange = u.must_change_pw === 1;
+  }
+  const path = new URL(c.req.url).pathname;
+  // A temporary password has to be replaced before anything else.
+  if (mustChange && !["/account", "/account/password", "/logout"].includes(path) && !path.startsWith("/theme/"))
+    return c.redirect("/account");
+  if (who.role !== "admin" && adminOnlyPath(path))
+    return c.html(
+      layout({
+        c,
+        title: "Admins only",
+        body: `<h1>Admins only</h1><p class="sub">This area is limited to admin accounts. Ask the account owner if you need it.</p><p><a href="/">Back to the dashboard</a></p>`,
+      }),
+      403
+    );
+  return runAs(who, () => next());
+});
+
+/*
+ * Theme switch (Command Console, 2026-09-14). A navigation, not a client-side toggle: clicking either
+ * rail link is already a full page load, so re-rendering every CSS variable server-side needs no JS at
+ * all and never risks a flash of the wrong theme before a script runs. Below the auth gate, like every
+ * other action in this app — nothing about a theme choice needs to be reachable by a stranger.
+ *
+ * `mode` is constrained by the route pattern to the literal strings "dark"/"light" before setCookie
+ * ever sees it, and `return` is validated here rather than trusted — it is user-suppliable input on
+ * every request, even though every link this app renders only ever sends its own current path. Only a
+ * same-app relative path (starts with "/", not "//") is honoured; anything else falls back to "/".
+ */
+app.get("/theme/:mode", (c) => {
+  const mode = c.req.param("mode");
+  if (mode !== "dark" && mode !== "light") return c.notFound();
+  setCookie(c, THEME_COOKIE, mode, {
+    httpOnly: true,
+    secure: true,
+    sameSite: "Lax",
+    path: "/",
+    maxAge: 365 * 86400,
+  });
+  const ret = c.req.query("return") ?? "/";
+  return c.redirect(ret.startsWith("/") && !ret.startsWith("//") ? ret : "/");
 });
 
 // ---------------------------------------------------------------- dashboard
 
-const listOrEmpty = (rows: Contact[], empty: string, extra?: (r: Contact) => string) =>
+const listOrEmpty = (
+  rows: Contact[],
+  empty: string,
+  extra?: (r: Contact) => string,
+  dot?: (r: Contact) => "red" | "amber" | "green" | "grey"
+) =>
   rows.length
-    ? `<table><tbody>${rows
+    ? `<div class="list">${rows
         .map(
-          (r) => `<tr>
-        <td><a href="/contacts/${r.id}"><b>${esc(r.full_name)}</b></a>${r.organization_name ? `<div class="meta">${esc(r.organization_name)}</div>` : ""}</td>
-        <td>${extra ? extra(r) : `<span class="pill grey">${esc(stageLabel(r.stage))}</span>`}</td>
-        <td style="text-align:right" data-label="Follow-up">${followUpPill(r.next_follow_up, r.stage)}</td>
-      </tr>`
+          (r) => `<div class="listrow">
+        <span class="dot ${dot ? dot(r) : followUpDotClass(r.next_follow_up, r.stage)}"></span>
+        <span class="avatar">${esc(initials(r.full_name))}</span>
+        <div class="listrow-main">
+          <div class="listrow-name"><a href="/contacts/${r.id}">${esc(r.full_name)}</a> ${priorityBadge(r)}</div>
+          ${r.organization_name ? `<div class="meta">${esc(r.organization_name)}</div>` : ""}
+        </div>
+        <div class="listrow-meta">
+          ${extra ? extra(r) : `<span class="pill grey">${esc(stageLabel(r.stage))}</span>`}
+          ${followUpPill(r.next_follow_up, r.stage)}
+        </div>
+      </div>`
         )
-        .join("")}</tbody></table>`
+        .join("")}</div>`
     : `<div class="empty">${empty}</div>`;
 
 /** Meeting rows carry the meeting date/time and the resolution actions inline. */
-const meetingList = (rows: Contact[], empty: string) =>
+const meetingList = (rows: Contact[], empty: string, dotClass: "red" | "amber" | "green" | "grey" = "grey") =>
   rows.length
-    ? `<table><tbody>${rows
+    ? `<div class="list">${rows
         .map(
-          (r) => `<tr>
-        <td>
-          <a href="/contacts/${r.id}"><b>${esc(r.full_name)}</b></a>
+          (r) => `<div class="listrow">
+        <span class="dot ${dotClass}"></span>
+        <span class="avatar">${esc(initials(r.full_name))}</span>
+        <div class="listrow-main">
+          <div class="listrow-name"><a href="/contacts/${r.id}">${esc(r.full_name)}</a> ${priorityBadge(r)}</div>
           ${r.organization_name ? `<div class="meta">${esc(r.organization_name)}</div>` : ""}
-        </td>
-        <td data-label="Meeting"><b>${esc(r.meeting_date)}</b>${r.meeting_time ? `<div class="meta">${esc(formatTime(r.meeting_time))}</div>` : ""}</td>
-        <td style="text-align:right" data-label="Log the outcome">${MEETING_OUTCOMES.map(
-          ([v, label]) =>
-            `<a class="pill" style="margin-left:4px" href="/contacts/${r.id}?log_meeting=${v}#record">${esc(label)}</a>`
-        ).join("")}</td>
-      </tr>`
+        </div>
+        <div class="listrow-meta">
+          <div><b>${esc(r.meeting_date)}</b>${r.meeting_time ? ` · ${esc(formatTime(r.meeting_time))}` : ""}</div>
+          <div>${MEETING_OUTCOMES.map(
+            ([v, label]) =>
+              `<a class="pill" style="margin-left:4px" href="/contacts/${r.id}?log_meeting=${v}#record">${esc(label)}</a>`
+          ).join("")}</div>
+        </div>
+      </div>`
         )
-        .join("")}</tbody></table>`
+        .join("")}</div>`
+    : `<div class="empty">${empty}</div>`;
+
+/**
+ * Outreach batch rows (dashboard section 5, 2026-09-15). These contacts are backlog by construction
+ * (Not Contacted or Reach Out Later) with no follow-up date or one that has already arrived, so the
+ * follow-up pill listOrEmpty() would show is always "none set" — dead space repeated on every row.
+ * The next actual move on a backlog contact is almost always "look them up on LinkedIn", so that slot
+ * carries the LinkedIn link instead, using the same three-way rule the contact record uses: a URL on
+ * file, a deliberate "no profile" mark, or a prompt to go find one.
+ */
+/**
+ * + Outreach (Phase 2a, the owner 2026-09-25: "I should be able to click next to the name to include it in
+ * my outreach batch"). A plain form post that toggles queued/not queued and comes back to this section;
+ * a drafted person shows "Drafted", linking to the draft. Null state = not an admin: no control at all.
+ */
+const outreachToggle = (r: Contact, state: Map<number, string> | null) => {
+  if (!state) return "";
+  const st = state.get(r.id);
+  if (st === "drafted") return `<a class="pill green" href="/outreach">Drafted</a>`;
+  return `<form method="post" action="/outreach/toggle/${r.id}" style="display:inline"><input type="hidden" name="return" value="/#outreach-batch"><button type="submit" class="tiny ${st ? "" : "secondary"}" aria-pressed="${st ? "true" : "false"}" title="${st ? "Queued for outreach. Click to remove." : "Add to your outreach queue"}">${st ? "Queued ✓" : "+ Outreach"}</button></form>`;
+};
+
+const batchList = (rows: Contact[], empty: string, state: Map<number, string> | null = null) =>
+  rows.length
+    ? `<div class="list">${rows
+        .map(
+          (r) => `<div class="listrow">
+        <span class="dot grey"></span>
+        <span class="avatar">${esc(initials(r.full_name))}</span>
+        <div class="listrow-main">
+          <div class="listrow-name"><a href="/contacts/${r.id}">${esc(r.full_name)}</a> ${priorityBadge(r)}</div>
+          ${r.organization_name ? `<div class="meta">${esc(r.organization_name)}</div>` : ""}
+        </div>
+        <div class="listrow-meta">
+          ${outreachToggle(r, state)}
+          <span class="pill grey">Tier ${esc(r.priority_tier ?? "—")}</span>
+          ${
+            r.linkedin_url
+              ? `<a class="pill" href="${esc(r.linkedin_url)}" target="_blank" rel="noopener">LinkedIn ↗</a>`
+              : r.no_linkedin
+                ? '<span class="pill grey">no profile</span>'
+                : '<a class="pill grey" href="/linkedin">find it</a>'
+          }
+        </div>
+      </div>`
+        )
+        .join("")}</div>`
     : `<div class="empty">${empty}</div>`;
 
 /** Why a contact landed in Needs Attention — stated per row so the fix is obvious. */
@@ -262,6 +457,19 @@ function attentionReason(r: Contact): string {
   return `<span class="pill amber">${esc(stageLabel(r.stage))} · no follow-up date</span>`;
 }
 
+/** The dot color for a Needs Attention row — mirrors the pill colors attentionReason() renders above. */
+function attentionDot(r: Contact): "red" | "amber" {
+  if (r.stage === "meeting_scheduled" && !r.meeting_date) return "red";
+  if (r.stage === "follow_up_action") return "red";
+  return "amber";
+}
+
+/** The dot color for a "what you owe" row — mirrors owedNote()'s pill above. */
+function owedDot(r: Contact): "red" | "amber" | "green" | "grey" {
+  if (!r.next_follow_up) return "red";
+  return followUpDotClass(r.next_follow_up, r.stage);
+}
+
 /**
  * An owed commitment with no date on it is the single easiest thing to lose, so section 2 says so on
  * the row rather than leaving a quiet grey "none set" to be scrolled past.
@@ -288,7 +496,7 @@ app.get("/", async (c) => {
    * Collapsible sections (#70). Seven sections stacked, and reaching section 7 means scrolling past
    * six; collapsing the ones already dealt with turns the page into a short index.
    *
-   * Whole sections only, ruling out nested collapse inside a section and also
+   * Whole sections only — the owner, 2026-08-04, ruling out nested collapse inside a section and also
    * ruling out the cheaper "auto-collapse the empty ones" idea, on the grounds that an empty section
    * is already one line and costs no real estate. That removed the only option that worked without
    * persisted state, which is what makes the cookie below necessary rather than a nicety: this
@@ -298,8 +506,8 @@ app.get("/", async (c) => {
    *
    * Cookie rather than a ui_preference table: one user, one browser at a time, no audit interest in
    * which panels are shut. A migration and a POST round-trip per toggle is a lot of machinery for a
-   * scroll problem — and if this ever needs to follow the operator across devices, that is the moment
-   * to move it server-side, not now.
+   * scroll problem — and if this ever needs to follow him across devices, that is the moment to move
+   * it server-side, not now.
    *
    * The cookie is client-written, so it is whitelisted rather than trusted: only the literal section
    * numbers 1-7 survive parsing. Anything else in that header is discarded and the section opens.
@@ -321,7 +529,7 @@ app.get("/", async (c) => {
   const base = `SELECT c.*, o.name AS organization_name FROM contact c LEFT JOIN organization o ON o.id = c.organization_id WHERE c.status='active'`;
   const activeStageList = ACTIVE_STAGES.map((s) => `'${s}'`).join(",");
   /*
-   * Both follow-up lists exclude the terminal stages (2026-08-01: "I've marked them complete
+   * Both follow-up lists exclude the terminal stages (the owner, 2026-08-01: "I've marked them complete
    * with no follow up, I don't need to be reminded... I don't need no response on the overdue follow
    * up list").
    *
@@ -334,7 +542,7 @@ app.get("/", async (c) => {
   const terminalStageList = TERMINAL_STAGES.map((s) => `'${s}'`).join(",");
 
   /*
-   * SECTION 3 OWNS AWAITING RESPONSE, so section 6 does not repeat it (2026-08-04).
+   * SECTION 3 OWNS AWAITING RESPONSE, so section 6 does not repeat it (the owner, 2026-08-04).
    *
    * A second exclusion with a second reason, kept separate from the terminal-stage filter above rather
    * than folded into one list: terminal stages are excluded because they have no next step at all, and
@@ -364,19 +572,34 @@ app.get("/", async (c) => {
    */
   const chaseOwnedStage = "'awaiting_response'";
 
+  /*
+   * PRIORITY CONTACTS LEAD EVERY WORK LIST (migration 0029, the owner 2026-09-23: "anyone with this stage
+   * would be automatically shown at the top of the various dashboard lists"). Prepended as the FIRST key,
+   * so each list's own logic still orders within the two groups — an overdue priority contact comes
+   * before an overdue regular one, and both groups stay in date order. Where a list has a LIMIT, flagged
+   * contacts win the slots, which is the point.
+   *
+   * The meeting lists in section 1 are deliberately NOT reordered: a calendar out of time order is a
+   * wrong calendar. They carry the badge instead.
+   */
+  const PRIORITY_FIRST = PRIORITY_FIRST_ORDER;
+
   // Meetings are driven by meeting_date (migration 0004), not by stage. Weeks run Sunday–Saturday.
   const meetingsThisWeek = await q(
     `${base} AND c.meeting_date IS NOT NULL AND c.meeting_date >= date('now') AND c.meeting_date <= ${THIS_WEEK_END}
-     ORDER BY c.meeting_date, c.meeting_time`
+     ORDER BY c.meeting_date, ${MEETING_TIME_ORDER}`
   );
   const meetingsNextWeek = await q(
     `${base} AND c.meeting_date IS NOT NULL AND c.meeting_date >= ${NEXT_WEEK_START} AND c.meeting_date <= ${NEXT_WEEK_END}
-     ORDER BY c.meeting_date, c.meeting_time`
+     ORDER BY c.meeting_date, ${MEETING_TIME_ORDER}`
   );
   // A meeting whose date has passed but was never resolved: held-and-not-logged, cancelled, or a no-show.
   const meetingsUnresolved = await q(
     `${base} AND c.meeting_date IS NOT NULL AND c.meeting_date < date('now') ORDER BY c.meeting_date`
   );
+  // What the hourly calendar sync changed in the last day (2026-09-25), shown at the top of section 1
+  // so a wrong pick-up is caught at a glance. Hidden when empty.
+  const calendarUpdates = await recentCalendarUpdates(c.env.DB, 24).catch(() => []);
   const meetingsLater = await q(
     `${base} AND c.meeting_date IS NOT NULL AND c.meeting_date > ${NEXT_WEEK_END} ORDER BY c.meeting_date LIMIT 10`
   );
@@ -390,7 +613,7 @@ app.get("/", async (c) => {
    */
   const actions = await openActions(c.env.DB).catch(() => []);
   const owed = await q(
-    `${base} AND c.stage='follow_up_action' ORDER BY (c.next_follow_up IS NOT NULL), c.next_follow_up, c.full_name`
+    `${base} AND c.stage='follow_up_action' ORDER BY ${PRIORITY_FIRST}, (c.next_follow_up IS NOT NULL), c.next_follow_up, c.full_name`
   );
   const owedUndated = owed.filter((r) => !r.next_follow_up).length;
 
@@ -399,10 +622,10 @@ app.get("/", async (c) => {
   // already tried on them". chaseList() orders by silence and carries the attempt history.
   const chasing = await chaseList(c.env.DB).catch(() => []);
   const pushing = await q(
-    `${base} AND c.stage='in_conversation' AND c.meeting_date IS NULL ORDER BY (c.next_follow_up IS NULL), c.next_follow_up`
+    `${base} AND c.stage='in_conversation' AND c.meeting_date IS NULL ORDER BY ${PRIORITY_FIRST}, (c.next_follow_up IS NULL), c.next_follow_up`
   );
   /*
-   * A booked meeting suppresses BOTH follow-up lists (#75, 2026-08-04).
+   * A booked meeting suppresses BOTH follow-up lists (#75, the owner 2026-08-04).
    *
    * The `meeting_date IS NULL` predicate below used to be on the Upcoming query only. The comment
    * above that query, the section 6 footer text, and this filter all claimed the rule applied to
@@ -412,8 +635,8 @@ app.get("/", async (c) => {
    * section 1 with a meeting, and again under Overdue as if they were late.
    *
    * Settled the way the copy already described: the meeting IS the next step, so a contact with one
-   * belongs in section 1 and nowhere else. A deliberate call, and the residual risk is owned directly —
-   * where a real commitment is outstanding AND a meeting is booked, it gets recorded as an action item
+   * belongs in section 1 and nowhere else. The owner's call, and he owns the residual risk directly —
+   * where a real commitment is outstanding AND a meeting is booked, he records it as an action item
    * in section 2, which names what is owed rather than merely when. That is the honest home for it;
    * the follow-up date never said what the commitment was.
    *
@@ -426,7 +649,7 @@ app.get("/", async (c) => {
        AND c.meeting_date IS NULL
        AND c.stage NOT IN (${terminalStageList})
        AND c.stage <> ${chaseOwnedStage}
-     ORDER BY c.next_follow_up`
+     ORDER BY ${PRIORITY_FIRST}, c.next_follow_up`
   );
   /*
    * Upcoming follow-ups (REL-004, #14). The half of that issue that was never built: until now a
@@ -458,18 +681,18 @@ app.get("/", async (c) => {
        AND c.meeting_date IS NULL
        AND c.stage NOT IN (${terminalStageList})
        AND c.stage <> ${chaseOwnedStage}
-     ORDER BY c.next_follow_up, c.full_name`
+     ORDER BY ${PRIORITY_FIRST}, c.next_follow_up, c.full_name`
   );
   /*
    * Outreach batch — backlog contacts that are actually actionable now. A deliberate deferral date is
    * respected: a contact set to Reach Out Later in 8 weeks is NOT in this week's batch. Found
    * 2026-07-30, when a contact snoozed for 56 days appeared reading "in 56d" on the same line.
    */
-  const batch = await q(
-    `${base} AND c.stage IN ('not_contacted','reach_out_later')
-       AND (c.next_follow_up IS NULL OR c.next_follow_up <= date('now'))
-     ORDER BY (c.priority_tier IS NULL), c.priority_tier, c.full_name LIMIT 15`
-  );
+  // The rule lives in outreach.ts (BATCH_CONDITION/BATCH_ORDER) so a schedule's "top up from the
+  // Outreach Batch" means exactly the people this section shows.
+  const batch = await q(`${base} AND ${BATCH_CONDITION} ORDER BY ${BATCH_ORDER} LIMIT 15`);
+  // Admins get a + Outreach toggle per row (Phase 2a); members don't see outreach at all.
+  const outreachState = isAdmin() ? await activeOutreach(c.env.DB) : null;
   const batchTotals = await c.env.DB.prepare(
     `SELECT
        SUM(next_follow_up IS NOT NULL AND next_follow_up > date('now')) AS deferred,
@@ -483,7 +706,7 @@ app.get("/", async (c) => {
     `${base} AND (
         (c.next_follow_up IS NULL AND c.meeting_date IS NULL AND c.stage IN (${activeStageList}))
         OR (c.stage='meeting_scheduled' AND c.meeting_date IS NULL)
-     ) ORDER BY c.full_name`
+     ) ORDER BY ${PRIORITY_FIRST}, c.full_name`
   );
   const totals = await c.env.DB.prepare(
     "SELECT COUNT(*) AS total, SUM(status='active') AS active FROM contact"
@@ -495,13 +718,16 @@ app.get("/", async (c) => {
    * on it, so it is one of the things you can see needs doing without being an eighth thing to scroll past.
    */
   const missingLinkedIn = await missingLinkedInCount(c.env.DB).catch(() => 0);
+  // Size of the priority inner circle (migration 0029), for the linkbar chip that opens it as a search.
+  const priorityCount =
+    (await c.env.DB.prepare("SELECT COUNT(*) AS n FROM contact WHERE status='active' AND is_priority = 1").first<{ n: number }>())?.n ?? 0;
   /*
    * Hours logged so far this week (TIME-001, #90). A LINK WITH A NUMBER ON IT, not an eighth section.
    *
    * The dashboard answers "what do I do today" about relationships; time entry is a different activity
    * with its own page and its own week navigation, and a section here would either duplicate that page or
-   * be a number with nothing to do. But the number itself belongs on the screen the operator opens every
-   * day, because the failure mode for a timesheet is forgetting it exists until Friday.
+   * be a number with nothing to do. But the number itself belongs on the screen the owner opens every day,
+   * because the failure mode for a timesheet is forgetting it exists until Friday.
    *
    * The FULL Sunday–Saturday week containing today, deliberately unlike the meeting sections above, which
    * run today→Saturday because a meeting that already happened is not upcoming. Hours already worked are
@@ -538,6 +764,7 @@ app.get("/", async (c) => {
     layout({
       title: "Dashboard",
       banner: banners,
+      c,
       body: `<main>
   ${
     { attempt: '<div class="flash ok">Attempt recorded. It is in the contact’s history and the silence clock has reset.</div>',
@@ -546,59 +773,99 @@ app.get("/", async (c) => {
       badchannel: '<div class="flash warn">That was not a channel I recognise, so nothing was recorded.</div>' }[c.req.query("flash") ?? ""] ?? ""
   }
   <h1>Weekly Dashboard</h1>
-  <p class="sub">${totals?.total ?? 0} contacts (${totals?.active ?? 0} active) · <a href="/contacts">browse all</a> · <a href="/actions">action items</a> · <a href="/templates">templates</a> · <a href="/referrals">referrals</a> · <a href="/import">import</a> · <a href="/health">system health</a>${
-        missingLinkedIn ? ` · <a href="/linkedin">${missingLinkedIn} missing LinkedIn</a>` : ""
-      }</p>
-  <p class="sub" style="margin-top:-14px"><a href="/time">${
-    hoursThisWeek ? `${hoursThisWeek % 1 === 0 ? hoursThisWeek : hoursThisWeek.toFixed(2).replace(/0$/, "")} hours logged this week` : "log time"
-  }</a> · <a href="/time/report">weekly hours</a> · <a href="/engagements">customers</a></p>
+  <p class="meta" style="margin:0 0 4px">${totals?.total ?? 0} contacts (${totals?.active ?? 0} active)</p>
+  <div class="linkbar">
+    <a class="linkchip" href="/contacts">Browse All</a>
+    ${priorityCount ? `<a class="linkchip count" href="/contacts?priority=1">★ ${priorityCount} Priority</a>` : ""}
+    <a class="linkchip" href="/actions">Action Items</a>
+    <a class="linkchip" href="/templates">Templates</a>
+    <a class="linkchip" href="/referrals">Referrals</a>
+    <a class="linkchip" href="/import">Import</a>
+    <a class="linkchip" href="/health">System Health</a>
+    ${missingLinkedIn ? `<a class="linkchip count" href="/linkedin">${missingLinkedIn} Missing LinkedIn</a>` : ""}
+    <a class="linkchip" href="/time">${
+      hoursThisWeek ? `${hoursThisWeek % 1 === 0 ? hoursThisWeek : hoursThisWeek.toFixed(2).replace(/0$/, "")} Hours Logged` : "Log Time"
+    }</a>
+    <a class="linkchip" href="/time/report">Weekly Hours</a>
+    <a class="linkchip" href="/engagements">Customers</a>
+  </div>
+
+  <div class="stat-row">
+    <div class="stat"><div class="stat-num">${totals?.active ?? 0}</div><div class="stat-label">Active Contacts</div></div>
+    <div class="stat"><div class="stat-num">${meetingsThisWeek.length}</div><div class="stat-label">Meetings This Week</div></div>
+    <div class="stat"><div class="stat-num">${chasing.length}</div><div class="stat-label">Awaiting Response</div></div>
+    <div class="stat"><div class="stat-num">${needsAttention.length}</div><div class="stat-label">Needs Attention</div></div>
+    <div class="stat"><div class="stat-num">${pursuitsDue.length}</div><div class="stat-label">Pursuits Due</div></div>
+  </div>
 
   <section><details class="dash" data-sec="1"${openAttr(1)}>
-    <summary><h2>1 · Upcoming Meetings</h2></summary>
+    <summary><span class="card-h">${SECTION_ICONS[1]}<h2>1 · Upcoming Meetings</h2></span></summary>
     ${
       meetingsUnresolved.length
         ? `<h3 style="font-size:13px;color:#b91c1c;margin:4px 0 6px">Needs Resolution — date has passed</h3>
-           ${meetingList(meetingsUnresolved, "")}
+           ${meetingList(meetingsUnresolved, "", "red")}
            <p class="meta" style="margin:6px 0 16px">Held, cancelled, or a no-show — pick one and the interaction gets recorded.</p>`
         : ""
     }
     <h3 style="font-size:13px;color:var(--muted);margin:4px 0 6px">This Week — through ${esc(weekEnds?.this_end ?? "Saturday")}</h3>
-    ${meetingList(meetingsThisWeek, "No meetings scheduled for the rest of this week.")}
+    ${meetingList(meetingsThisWeek, "No meetings scheduled for the rest of this week.", "green")}
     <h3 style="font-size:13px;color:var(--muted);margin:16px 0 6px">Next Week — ${esc(weekEnds?.next_start ?? "")} to ${esc(weekEnds?.next_end ?? "")}</h3>
-    ${meetingList(meetingsNextWeek, "Nothing on the calendar for next week yet.")}
+    ${meetingList(meetingsNextWeek, "Nothing on the calendar for next week yet.", "green")}
     ${
       meetingsLater.length
-        ? `<h3 style="font-size:13px;color:var(--muted);margin:16px 0 6px">Further Out</h3>${meetingList(meetingsLater, "")}`
+        ? `<h3 style="font-size:13px;color:var(--muted);margin:16px 0 6px">Further Out</h3>${meetingList(meetingsLater, "", "green")}`
         : ""
     }
-    <p class="meta" style="margin-top:10px">Weeks run Sunday–Saturday. Meeting dates are set on the contact record; Outlook calendar sync arrives in Phase 2.</p>
+    ${/* Below Further Out, not at the top (the owner, 2026-09-25): the section leads with the meetings
+         themselves; the list of what the sync picked up is a check to glance at afterwards. */ ""}
+    ${
+      calendarUpdates.length
+        ? `<h3 style="font-size:13px;color:var(--accent);margin:16px 0 6px">Picked up from your calendar, last 24 hours</h3>
+           <div class="list">${calendarUpdates
+             .map(
+               (u) => `<div class="listrow">
+             <span class="dot accent"></span>
+             <span class="avatar">${esc(initials(u.name))}</span>
+             <div class="listrow-main">
+               <div class="listrow-name"><a href="/contacts/${u.contactId}">${esc(u.name)}</a></div>
+               <div class="meta">${esc(describeUpdate(u))}</div>
+             </div>
+             <div class="listrow-meta"><a class="pill" href="/contacts/${u.contactId}/edit">Fix</a></div>
+           </div>`
+             )
+             .join("")}</div>
+           <p class="meta" style="margin:6px 0 0">Not a real meeting? Open it and clear or resolve it; the sync won't add that invite again. Recurring group meetings can be excluded on <a href="/health#meeting-sync">System Health</a>.</p>`
+        : ""
+    }
+    <p class="meta" style="margin-top:10px">Weeks run Sunday–Saturday. Meetings fill in from your Outlook invites every hour, or set one on the contact record. <a href="/health#meeting-sync">Calendar sync settings</a></p>
   </details></section>
 
   <section><details class="dash" data-sec="2"${openAttr(2)}>
-    <summary><h2>2 · What You Owe${actions.length || owed.length ? ` (${actions.length} item${actions.length === 1 ? "" : "s"}, ${owed.length} contact${owed.length === 1 ? "" : "s"})` : ""}</h2></summary>
+    <summary><span class="card-h">${SECTION_ICONS[2]}<h2>2 · What You Owe${actions.length || owed.length ? ` (${actions.length} item${actions.length === 1 ? "" : "s"}, ${owed.length} contact${owed.length === 1 ? "" : "s"})` : ""}</h2></span></summary>
     <h3 style="font-size:13px;color:var(--muted);margin:4px 0 6px">Action items — things you committed to <a href="/actions" style="font-weight:400">manage all</a></h3>
     ${actionBlock(actions)}
     <h3 style="font-size:13px;color:var(--muted);margin:18px 0 6px">Contacts whose next move is yours</h3>
-    ${listOrEmpty(owed, "Nobody is in the Follow-Up Action stage.", owedNote)}
+    ${listOrEmpty(owed, "Nobody is in the Follow-Up Action stage.", owedNote, owedDot)}
     <p class="meta" style="margin-top:8px">Action items are specific commitments and can be ticked off individually. The stage below says the ball is in your court without naming what you owe.${
       owedUndated ? ` <b>${owedUndated} contact${owedUndated === 1 ? "" : "s"} need${owedUndated === 1 ? "s" : ""} a follow-up date.</b>` : ""
     }</p>
   </details></section>
 
   <section><details class="dash" data-sec="3"${openAttr(3)}>
-    <summary><h2>3 · Chase Non-Responders${chasing.length ? ` (${chasing.length})` : ""}</h2></summary>
+    <summary><span class="card-h">${SECTION_ICONS[3]}<h2>3 · Chase Non-Responders</h2>${chasing.length ? `<span class="count">${chasing.length}</span>` : ""}</span></summary>
     ${chaseBlock(chasing)}
   </details></section>
 
   <section><details class="dash" data-sec="4"${openAttr(4)}>
-    <summary><h2>4 · In Conversation${pushing.length ? ` (${pushing.length})` : ""}</h2></summary>
+    <summary><span class="card-h">${SECTION_ICONS[4]}<h2>4 · In Conversation</h2>${pushing.length ? `<span class="count">${pushing.length}</span>` : ""}</span></summary>
     ${listOrEmpty(pushing, "Nobody in conversation without a meeting scheduled.")}
   </details></section>
 
-  <section><details class="dash" data-sec="5"${openAttr(5)}>
-    <summary><h2>5 · Outreach Batch — Ready Now${readyCount ? ` (${readyCount})` : ""}</h2></summary>
-    ${listOrEmpty(batch, "No backlog contacts are due — use <a href=\"/import\">import</a> to load the spreadsheet.", (r) => `<span class="pill grey">Tier ${esc(r.priority_tier ?? "—")}</span>`)}
-    <p class="meta" style="margin-top:8px">Backlog contacts (Not Contacted, Reach Out Later) with no follow-up date or one that has arrived, highest tier first.${
+  <section id="outreach-batch"><details class="dash" data-sec="5"${openAttr(5)}>
+    <summary><span class="card-h">${SECTION_ICONS[5]}<h2>5 · Outreach Batch — Ready Now</h2>${readyCount ? `<span class="count">${readyCount}</span>` : ""}</span></summary>
+    ${batchList(batch, "No backlog contacts are due — use <a href=\"/import\">import</a> to load the spreadsheet.", outreachState)}
+    ${outreachState && outreachState.size ? `<p class="meta" style="margin-top:8px"><a href="/outreach">${outreachState.size} in your outreach queue →</a></p>` : ""}
+    <p class="meta" style="margin-top:8px">Backlog contacts (Not Contacted, Reach Out Later) with no follow-up date or one that has arrived — priority contacts first, then highest tier.${
       readyCount > batch.length ? ` Showing ${batch.length} of ${readyCount} ready.` : ""
     }${
       batchTotals?.deferred
@@ -608,7 +875,7 @@ app.get("/", async (c) => {
   </details></section>
 
   <section><details class="dash" data-sec="6"${openAttr(6)}>
-    <summary><h2>6 · Follow-Ups${overdue.length || upcoming.length ? ` (${overdue.length} overdue, ${upcoming.length} coming up)` : ""}</h2></summary>
+    <summary><span class="card-h">${SECTION_ICONS[6]}<h2>6 · Follow-Ups${overdue.length || upcoming.length ? ` (${overdue.length} overdue, ${upcoming.length} coming up)` : ""}</h2></span></summary>
     <h3 style="font-size:13px;color:#b91c1c;margin:4px 0 6px">Overdue — the date has arrived</h3>
     ${listOrEmpty(overdue, "Nothing overdue — every scheduled follow-up is still in the future.")}
     <h3 style="font-size:13px;color:var(--muted);margin:16px 0 6px">Upcoming — due within ${UPCOMING_FOLLOW_UP_DAYS} days</h3>
@@ -617,30 +884,34 @@ app.get("/", async (c) => {
   </details></section>
 
   <section><details class="dash" data-sec="7"${openAttr(7)}>
-    <summary><h2>7 · Needs Attention${needsAttention.length ? ` (${needsAttention.length})` : ""}</h2></summary>
-    ${listOrEmpty(needsAttention, "Nothing adrift — every active relationship has a next step or a meeting booked.", attentionReason)}
+    <summary><span class="card-h">${SECTION_ICONS[7]}<h2>7 · Needs Attention</h2>${needsAttention.length ? `<span class="count">${needsAttention.length}</span>` : ""}</span></summary>
+    ${listOrEmpty(needsAttention, "Nothing adrift — every active relationship has a next step or a meeting booked.", attentionReason, attentionDot)}
     <p class="meta" style="margin-top:8px">The catch-all: active relationships with no next step, Meeting Scheduled with no meeting date, and Follow-Up Actions with no date. Complete, No Response, Retired, Not Qualified, and backlog contacts are excluded by design.</p>
   </details></section>
 
   ${/*
     SECTION 8, ADDED RATHER THAN INSERTED (PURS-001). Pursuits arguably matter more than sections 5 to 7
     — they are the revenue — but the section numbers are the keys the collapse cookie stores, so
-    inserting a new 2 would silently reopen or re-close every section the operator has set. A number is
+    inserting a new 2 would silently reopen or re-close every section the owner has set. A number is
     cheaper to argue about than a remembered layout that quietly resets. Say the word and it moves.
   */ ""}
   <section><details class="dash" data-sec="8"${openAttr(8)}>
-    <summary><h2>8 · Pursuits Needing You${pursuitsDue.length ? ` (${pursuitsDue.length})` : ""}</h2></summary>
+    <summary><span class="card-h">${SECTION_ICONS[8]}<h2>8 · Pursuits Needing You</h2>${pursuitsDue.length ? `<span class="count">${pursuitsDue.length}</span>` : ""}</span></summary>
     ${
       pursuitsDue.length
-        ? `<ul class="rows">${pursuitsDue
+        ? `<div class="list">${pursuitsDue
             .map(
-              (p) => `<li><a href="/engagements/${p.id}/edit"><b>${esc(p.name)}</b></a>
-        <span class="meta">${esc(p.organization_name ?? "no customer set")} · ${esc(
-          labelFor(ENGAGEMENT_STATUSES, p.status)
-        )}</span>
-        <div class="meta">${esc(p.why)}</div></li>`
+              (p) => `<div class="listrow">
+        <span class="dot amber"></span>
+        <span class="avatar">${esc(initials(p.name))}</span>
+        <div class="listrow-main">
+          <div class="listrow-name"><a href="/engagements/${p.id}/edit">${esc(p.name)}</a></div>
+          <div class="meta">${esc(p.organization_name ?? "no customer set")} · ${esc(labelFor(ENGAGEMENT_STATUSES, p.status))}</div>
+        </div>
+        <div class="listrow-meta"><span class="meta">${esc(p.why)}</span></div>
+      </div>`
             )
-            .join("")}</ul>`
+            .join("")}</div>`
         : '<p class="meta">Nothing due — every open pursuit has its next step and its decision date still ahead of it.</p>'
     }
     <p class="meta" style="margin-top:8px">Open pursuits whose next step is due, or whose expected decision date has arrived. This is the sales pipeline, not the relationship pipeline — the full list with amounts and the demand report is on <a href="/pursuits">Pursuits</a>. A pursuit with no dated next step cannot appear here at all, which is why that field is nagged about on the form.</p>
@@ -676,7 +947,7 @@ app.get("/", async (c) => {
 });
 
 // Mount order no longer decides behaviour. Since the duplicate GET /contacts was removed from
-// contacts.ts (#37), no (method, path) pair is registered twice across these eleven modules and no
+// contacts.ts (#37), no (method, path) pair is registered twice across these modules and no
 // route shadows another, so these lines can be reordered safely. Ownership, for orientation:
 // contactList owns GET /contacts and the contact delete/inactivate routes (REL-017, REL-019);
 // contacts.ts owns the record, the add/edit forms, and the interactions; exportsApp owns /export
@@ -684,17 +955,22 @@ app.get("/", async (c) => {
 // auditApp owns /audit (AUD-002); escalationApp owns /escalation (REL-008 Part B);
 // referralsApp owns /referrals (REL-005); linkedinApp owns /linkedin (REL-011);
 // engagementsApp owns /engagements (CUST-001); timeApp owns /time and /time/report (TIME-001);
+// meetingsApp owns /meetings — a read-only report over interaction rows contacts.ts already writes;
 // msGraphApp owns /auth/microsoft* (M365-001) — behind the session gate on purpose, see msgraph.ts;
 // calImportApp owns /time/import. It is mounted BEFORE timeApp, and that matters: timeApp registers
 // GET /time/:id/edit, which has two path segments after /time and so cannot shadow /time/import — but
 // keeping the more specific module first means a future /time/:something route cannot start swallowing it.
 // What IS still load-bearing is the app.use("*") session gate above: Hono middleware only wraps
 // routes registered after it, so these mounts must stay below it or they become unauthenticated.
+app.route("/", usersApp);
+app.route("/", settingsApp);
+app.route("/", outreachApp);
 app.route("/", health);
 app.route("/", auditApp);
 app.route("/", escalationApp);
 app.route("/", referralsApp);
 app.route("/", actionsApp);
+app.route("/", commitmentsApp);
 app.route("/", contactList);
 app.route("/", importer);
 app.route("/", bulkUpdateApp);
@@ -707,6 +983,9 @@ app.route("/", msGraphApp);
 app.route("/", pipelineApp);
 app.route("/", calImportApp);
 app.route("/", mailImportApp);
+app.route("/", meetingsApp);
+app.route("/", analyticsApp);
+app.route("/", pricingApp);
 app.route("/", timeApp);
 app.route("/", exportsApp);
 app.route("/", templatesApp);
@@ -715,11 +994,40 @@ app.route("/", digestApp);
 app.route("/", feedbackApp);
 app.route("/", activitiesApp);
 
+/*
+ * Phase 3b: a copy that was synced to new code but hasn't applied its database updates yet would hit
+ * "no such table/column" on some pages. Instead of a bare 500, say what happened and where to fix it.
+ * Anything else is still a plain 500, as Hono's default.
+ */
+app.onError((err, c) => {
+  if (isSchemaBehind(err)) {
+    const admin = isAdmin();
+    return c.html(
+      layout({
+        c,
+        title: "Just updated",
+        body: `<h1>This copy was just updated</h1>
+  <p class="sub">The app's code is newer than its database, so this page can't load yet.</p>
+  <p>${admin ? "Apply the database updates now. A backup is taken first, and it takes a few seconds." : "An admin needs to apply the database update on the Health page. Your data is safe."}</p>
+  ${
+    // The button is here as well as on Health, so an update never depends on Health itself rendering.
+    admin ? `<form method="post" action="/admin/db-update"><button type="submit">Apply Updates</button></form>` : ""
+  }`,
+      }),
+      503
+    );
+  }
+  console.error(err);
+  return c.text("Internal Server Error", 500);
+});
+
 export default {
   fetch: app.fetch,
   /*
-   * Three cron entries now share this handler, so it dispatches on which one fired rather than doing
-   * everything on every tick. Without the check the backup would run three times a day and the digest
+   * Four cron entries now share this handler, so it dispatches on which one fired rather than doing
+   * everything on every tick. EVERY NEW CRON MUST BE DISPATCHED HERE EXPLICITLY: the last line is the
+   * backup, so an entry added to wrangler.jsonc without a branch above it would take a backup on each
+   * tick — the hourly meeting sync (2026-09-24) would have meant 24 backups a day. Without the check the backup would run three times a day and the digest
    * would attempt a send at 07:00 — which the hour guard would refuse, but relying on a second guard to
    * undo a wrong dispatch is how a schedule quietly becomes wrong.
    */
@@ -729,10 +1037,25 @@ export default {
     ctx: { waitUntil(p: Promise<unknown>): void }
   ) {
     const cron = event?.cron ?? "";
-    if (DIGEST_CRONS.has(cron)) {
-      ctx.waitUntil(runDigest(env).catch(() => undefined));
-      return;
-    }
-    ctx.waitUntil(runBackup(env, "cron").catch((e) => recordBackupFailure(env, e)));
+    // Scheduled work is nobody's edit: it runs explicitly as "system" (auth.ts), which is also what
+    // actor() returns outside a request. Explicit, so it can never inherit an identity by accident.
+    runAs(SYSTEM, () => {
+      // Settings first (Phase 3a): the digest's hour and every "today" depend on the copy's timezone.
+      const ready = loadAppSettings(env.DB).catch(() => undefined);
+      const after = (f: () => Promise<unknown>) => ctx.waitUntil(ready.then(f));
+      if (DIGEST_CRONS.has(cron)) {
+        after(() => runDigest(env).catch(() => undefined));
+        return;
+      }
+      if (cron === MEETING_SYNC_CRON) {
+        after(() => runMeetingSync(env, "cron").catch(() => undefined));
+        return;
+      }
+      if (cron === OUTREACH_CRON) {
+        after(() => runOutreachTick(env).catch(() => undefined));
+        return;
+      }
+      after(() => runBackup(env, "cron").catch((e) => recordBackupFailure(env, e)));
+    });
   },
 };

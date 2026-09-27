@@ -5,10 +5,10 @@
 -- What was wrong
 -- --------------
 -- 0008 gave the ladder its two stored facts, and only POST /escalation/:id/attempt ever maintained them.
--- Everything logged through Record an Interaction — which is how most outreach gets recorded — moved
+-- Everything logged through Record an Interaction — which is how the owner records most outreach — moved
 -- the derived attempt count on the chase row and left the stored column untouched. On 2026-08-04 that
 -- produced a row reading "no attempt recorded" and "1 attempt · tried email" at the same time, for
--- a contact who had in fact just been emailed. The write side is fixed in contacts.ts; this catches
+-- one contact (377), on the day he was emailed. The write side is fixed in contacts.ts; this catches
 -- up the rows already in that state.
 --
 -- How many rows, and who
@@ -17,8 +17,8 @@
 -- had not counted, not one. Fourteen are in awaiting_response — the stage the chase list draws from — and
 -- thirteen of those fourteen had `last_attempt_at IS NULL` alongside an attempt dated 2026-08-04, so the
 -- chase list was sorting that morning's entire outreach to the top of the list as "never contacted".
--- The fourteenth contact's stored date is right, because they were later chased with the
--- button too, but their rung says 1 where two attempts exist. The remaining 26 sit in in_conversation,
+-- That contact (377) is the fourteenth: his stored date is right, because he was later chased with the
+-- button too, but his rung says 1 where two attempts exist. The remaining 26 sit in in_conversation,
 -- meeting_scheduled, complete, reach_out_later, stay_connected and no_response.
 --
 -- The definition used here is the one in src/attempts.ts: type IN (email, linkedin, text, call) AND the
@@ -53,7 +53,7 @@
 -- ----------------------------------
 -- `next_follow_up`. It is tempting — thirteen contacts were emailed on 2026-08-04 and the chase button
 -- would have set a follow-up three business days out. But those rows already carry 2026-08-07, set by
--- the interaction form from what the operator typed, and rewriting dates they chose in order to match what a
+-- the interaction form from what the owner typed, and rewriting dates he chose in order to match what a
 -- different button would have chosen is not a backfill. `last_touch` is likewise untouched: it is derived
 -- from interactions and was already correct throughout — it was never the field that failed.
 --

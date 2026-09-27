@@ -137,7 +137,7 @@ export async function backupStatus(db: D1Db): Promise<BackupStatus> {
   const last = await db
     .prepare("SELECT ts, status, detail FROM backup_run ORDER BY id DESC LIMIT 1")
     .first<{ ts: string; status: string; detail: string }>();
-  if (!last) return { state: "none", message: "No backup recorded yet — first nightly run pending (2:00 AM Central)." };
+  if (!last) return { state: "none", message: "No backup recorded yet — first nightly run pending (07:00 UTC)." };
   const ageHours = (Date.now() - new Date(last.ts.replace(" ", "T") + "Z").getTime()) / 3_600_000;
   if (last.status === "alert") return { state: "alert", message: `Backup alert (${last.ts} UTC): ${last.detail}` };
   if (ageHours > 26)

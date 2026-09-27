@@ -1,12 +1,14 @@
 /*
  * REL-023 — the health page.
  *
- * /health used to return raw JSON. Two problems: it had no header, so there was no way back to the
- * dashboard except the browser button, and it read like a log line rather than an answer —
- * `{"app":"ok","db":"ok",...}` states without saying what the state implies.
+ * /health used to return raw JSON. Two problems, both reported by the owner on 2026-07-31: it had no
+ * header, so there was no way back to the dashboard except the browser button, and it read like a log
+ * line rather than an answer. He looked at `{"app":"ok","db":"ok",...}` and said "I'm not sure what
+ * this means" — which is the correct reaction to a page that reports state without saying what the
+ * state implies.
  *
  * So the page now answers three questions per check: what is this, is it fine, and what do I do if it
- * is not. The JSON survives at /health.json for uptime monitors and for scripted checks.
+ * is not. The JSON survives at /health.json for uptime monitors and for me.
  */
 
 import { Hono } from "hono";
@@ -15,7 +17,18 @@ import { attemptDrift } from "./attempts";
 import { backupStatus, runBackup, recordBackupFailure } from "./backup";
 import { msConfigured, msConnection, msPanel } from "./msgraph";
 import { lastDigest, localStamp } from "./digest";
-import { DIGEST_ENABLED, isOn } from "./settings";
+import {
+  MAX_ATTENDEES,
+  changeExclusion,
+  describeUpdate,
+  lastMeetingSync,
+  meetingExclusions,
+  recentCalendarUpdates,
+  runMeetingSync,
+} from "./meetingsync";
+import { DIGEST_ENABLED, appSettings, isOn, zoneLabel } from "./settings";
+import { applyPending, migrationState } from "./migrate";
+import { actor } from "./auth";
 import { activityStatus, vocabularyStatus } from "./vocabulary";
 import { esc, layout } from "./views";
 import {
@@ -106,7 +119,7 @@ async function gather(env: Bindings): Promise<Check[]> {
    * #82. The chase list said "no attempt recorded" for a contact emailed that morning, because the
    * stored ladder columns and the count on the same row came from two different definitions. Both now
    * come from attempts.ts — this check is what notices if they ever separate again, rather than waiting
-   * for the operator to spot a row contradicting itself. Same argument as the stage vocabulary check above:
+   * for the owner to spot a row contradicting itself. Same argument as the stage vocabulary check above:
    * silent disagreement between two sources of truth is the failure worth engineering against.
    */
   const a = await attemptDrift(env.DB).catch(() => null);
@@ -176,20 +189,19 @@ async function gather(env: Bindings): Promise<Check[]> {
   });
 
   /*
-   * CAN A CONTACT STILL BE DELETED? (REL-031.)
+   * CAN A CONTACT STILL BE DELETED? (REL-031, 2026-08-20.)
    *
    * This check exists because of a specific self-inflicted outage. Migration 0020 added
    * contact_stage_event with an AFTER INSERT trigger, so every contact gained a child row, and the
    * delete path in contactList.ts was never told about the new table. contact_id is NOT NULL with no
    * ON DELETE CASCADE, so the DELETE aborted on a foreign key violation and the route 500'd —
-   * nearly every contact in the database was undeletable, for two days, with nothing anywhere
-   * reporting it. Auditing the rest of the schema then turned up time_entry.contact_id in the same
-   * state.
+   * 4,454 of 4,592 contacts undeletable, for two days, with nothing anywhere reporting it. Auditing
+   * the rest of the schema then turned up time_entry.contact_id in the same state.
    *
    * The lesson is not "remember contact_stage_event", it is that adding a table that references
    * contact(id) silently breaks deletion and no test covered it. So this reads the live schema and
    * compares it against the list the delete path actually handles. A new table shows up here as a
-   * warning the day it is created, instead of as a 500 the next time someone removes a bad row.
+   * warning the day it is created, instead of as a 500 whenever the owner next removes a bad row.
    *
    * HANDLED must stay in step with the delete path in contactList.ts. Each entry names how:
    *   interaction                        blocks deletion outright
@@ -201,6 +213,8 @@ async function gather(env: Bindings): Promise<Check[]> {
    *   engagement (origin_contact_id)     set to NULL
    *   engagement_contact                 deleted and audited
    *   email_import_exclusion             ON DELETE CASCADE — nothing to add to contactList.ts
+   *   outreach_item                      deleted and audited (0032; caught by this check on day one)
+   *   commitment                         contact_id set to NULL, audited; the commitment is kept (0035)
    *
    * engagement and engagement_contact (0022_pursuit.sql, PURS-001) are the second recurrence of this
    * exact bug: a migration added two more references to contact(id), neither carried ON DELETE CASCADE,
@@ -221,6 +235,8 @@ async function gather(env: Bindings): Promise<Check[]> {
     "engagement",
     "engagement_contact",
     "email_import_exclusion",
+    "outreach_item",
+    "commitment",
   ]);
   const refs = await env.DB.prepare(
     `SELECT name FROM sqlite_master WHERE type='table'
@@ -345,7 +361,7 @@ async function digestPanel(db: Bindings["DB"], flash: string, outcome: string): 
   const on = await isOn(db, DIGEST_ENABLED).catch(() => false);
   const last = await lastDigest(db);
   const FLASH: Record<string, string> = {
-    on: "Daily digest turned on. It arrives on weekdays at about 6am Central, and only when something is due.",
+    on: "Daily digest turned on. It arrives on weekdays at about ${appSettings().digestHour}:00 ${zoneLabel()}, and only when something is due.",
     off: "Daily digest turned off. Nothing will be sent until you turn it back on.",
     test: `Test digest attempted — outcome: ${outcome || "unknown"}.`,
   };
@@ -380,6 +396,80 @@ async function digestPanel(db: Bindings["DB"], flash: string, outcome: string): 
   </section>`;
 }
 
+/**
+ * Meetings from the calendar (migration 0030). Same rule as the digest panel: the last run is always
+ * reported, because an hourly job that finds nothing new looks exactly like one that is broken.
+ */
+async function meetingSyncPanel(db: Bindings["DB"], flash: string): Promise<string> {
+  const last = await lastMeetingSync(db).catch(() => null);
+  const KIND: Record<string, string> = { new: "new meeting", rescheduled: "rescheduled", linked: "linked to your entry" };
+  const pill = !last ? "grey" : last.state === "ok" ? "green" : last.state === "error" ? "red" : "grey";
+  const word = !last ? "Not yet run" : last.state === "ok" ? "Working" : last.state === "error" ? "Problem" : "Not connected";
+  const changes = last?.changes ?? [];
+  const exclude = await meetingExclusions(db).catch(() => [] as string[]);
+  const recent = await recentCalendarUpdates(db, 24).catch(() => []);
+  return `<section id="meeting-sync">
+    <h2>Meetings from Your Calendar <span class="pill ${pill}" style="margin-left:6px">${word}</span></h2>
+    ${flash === "synced" ? `<p class="flash ok">Calendar checked just now.</p>` : ""}
+    ${flash === "excluded" ? `<p class="flash ok">Exclusion list updated. It applies from the next sync.</p>` : ""}
+    <p style="margin:0 0 6px">Every hour, the app reads your Outlook calendar for the next 60 days. When a contact is on an invite, whether you sent it or they did, their record moves to <b>Meeting Scheduled</b> with the meeting's date and time. You no longer have to type it in.</p>
+    <p class="meta" style="margin:0 0 10px">Rescheduling in Outlook moves the date on the record. A date you typed yourself is never overwritten. Cancelled and all-day events are skipped, as are meetings with more than ${MAX_ATTENDEES} attendees, and so are Retired contacts and anyone who declined. A cancelled meeting stays on the record until you resolve it.</p>
+    <dl class="grid2">
+      <dt>Last run</dt><dd>${
+        last
+          ? `${esc(localStamp(last.at.slice(0, 19).replace("T", " ")))} (${last.origin === "cron" ? "automatic" : "you ran it"}): ${esc(last.detail)}`
+          : '<span class="meta">never run yet. The first automatic run is at a quarter past the hour.</span>'
+      }</dd>
+      ${
+        changes.length
+          ? `<dt>Updated</dt><dd>${changes
+              .map(
+                (ch) =>
+                  `<a href="/contacts/${ch.id}">${esc(ch.name)}</a> <span class="meta">(${esc(KIND[ch.kind] ?? ch.kind)}, ${esc(ch.date)}${ch.time ? ` ${esc(ch.time)}` : ""})</span>`
+              )
+              .join("<br>")}</dd>`
+          : ""
+      }
+      ${last && last.excluded ? `<dt>Skipped</dt><dd class="meta">${last.excluded} event${last.excluded === 1 ? "" : "s"} matched your exclusions.</dd>` : ""}
+      ${last && last.keptHandEntered ? `<dt>Left alone</dt><dd class="meta">${last.keptHandEntered} contact${last.keptHandEntered === 1 ? "" : "s"} whose meeting date you typed yourself differs from the calendar.</dd>` : ""}
+    </dl>
+    <form method="post" action="/admin/meeting-sync" class="actions"><button class="secondary" type="submit">Sync Meetings Now</button></form>
+
+    <h3 style="font-size:14px;margin:18px 0 6px">Added from your calendar, last 24 hours</h3>
+    <p class="meta" style="margin:0 0 6px">A quick check, nothing to do unless one is wrong. Each is a meeting the sync put on a record that is still there. If one isn't a real meeting with that person, click <b>fix</b> and clear or resolve it, and it drops off this list. If it's a recurring group meeting, add its title to the exclusions below as well, so future ones are skipped.</p>
+    ${
+      recent.length
+        ? `<ul style="margin:0;padding-left:18px">${recent
+            .map(
+              (u) =>
+                `<li><a href="/contacts/${u.contactId}">${esc(u.name)}</a> <span class="meta">${esc(describeUpdate(u))} · <a href="/contacts/${u.contactId}/edit">fix</a></span></li>`
+            )
+            .join("")}</ul>`
+        : '<p class="meta" style="margin:0">Nothing to check. No meetings added or changed in the last 24 hours are still on a record.</p>'
+    }
+
+    <h3 style="font-size:14px;margin:18px 0 6px">Never add meetings whose title contains</h3>
+    <p class="meta" style="margin:0 0 8px">For standing group meetings that aren't meetings with a contact, like a recurring lunch. Matching ignores capitals and works on any part of the invite title. A meeting already on a record stays there until you resolve it or edit it.</p>
+    <div style="display:flex;flex-wrap:wrap;gap:6px;margin:0 0 10px">${
+      exclude.length
+        ? exclude
+            .map(
+              (p) => `<form method="post" action="/admin/meeting-sync/unexclude" style="margin:0">
+          <input type="hidden" name="phrase" value="${esc(p)}">
+          <button type="submit" class="secondary" style="padding:4px 10px;font-size:13px" title="Stop excluding &quot;${esc(p)}&quot;">${esc(p)} ✕</button>
+        </form>`
+            )
+            .join("")
+        : '<span class="meta">Nothing excluded.</span>'
+    }</div>
+    <form method="post" action="/admin/meeting-sync/exclude" style="display:flex;gap:8px;flex-wrap:wrap;margin:0">
+      <input type="text" id="meeting-exclude-phrase" name="phrase" maxlength="100" placeholder="e.g. Accountability Lunch" aria-label="Title phrase to exclude" style="flex:1;min-width:0;max-width:320px" required>
+      <button type="submit" class="secondary">Add</button>
+    </form>
+    <p class="meta" style="margin:8px 0 0">To keep one <em>person</em> out instead, set their stage to Retired.</p>
+  </section>`;
+}
+
 const PILL: Record<State, string> = { ok: "green", warn: "amber", error: "red", none: "grey" };
 const WORD: Record<State, string> = { ok: "Healthy", warn: "Needs attention", error: "Problem", none: "Not yet run" };
 
@@ -403,7 +493,7 @@ app.get("/health", async (c) => {
     .join("");
 
   return c.html(
-    layout({
+    layout({ c,
       title: "System Health",
       body: `<main>
   <h1>System Health</h1>
@@ -414,9 +504,11 @@ app.get("/health", async (c) => {
         ? "Mostly working, but something below wants a look."
         : "Something is wrong. Read the items marked Problem below."
   } · <a href="/">back to dashboard</a></p>
+  ${await dbUpdatePanel(c.env.DB, c.req.query("dbflash") ?? "", c.req.query("dbdetail") ?? "")}
   ${rows}
   ${msPanel(c.env, await msConnection(c.env.DB).catch(() => null), c.req.query("msflash") ?? "", c.req.query("msdetail") ?? "")}
   ${await digestPanel(c.env.DB, c.req.query("digest") ?? "", c.req.query("outcome") ?? "")}
+  ${await meetingSyncPanel(c.env.DB, c.req.query("meetings") ?? "")}
   <section>
     <h2>Backup</h2>
     <p class="meta" style="margin:0 0 12px">Backups run automatically each morning. Run one by hand before anything risky — a bulk import, or a change to how data is stored.</p>
@@ -429,6 +521,51 @@ app.get("/health", async (c) => {
 </main>`,
     })
   );
+});
+
+/**
+ * Database updates (Phase 3b). Shown first when something is pending, because a copy whose code has
+ * been updated but whose database hasn't is the one state where other pages may fail.
+ */
+async function dbUpdatePanel(db: Bindings["DB"], flash: string, detail: string): Promise<string> {
+  const st = await migrationState(db).catch(() => null);
+  if (!st) return "";
+  const note =
+    flash === "applied"
+      ? `<p class="flash ok" style="margin:0 0 10px">Database updated: ${esc(detail)}.</p>`
+      : flash === "failed" || flash === "refused"
+        ? `<p class="flash warn" style="margin:0 0 10px">${esc(detail)}</p>`
+        : "";
+  if (st.outOfStep)
+    return `<section><h2>Database updates <span class="pill red" style="margin-left:6px">Problem</span></h2>${note}<p style="margin:0">The database has tables that its update log doesn't account for, so the app won't apply updates automatically. This needs a hand from whoever set up this copy.</p></section>`;
+  if (!st.pending.length)
+    return note ? `<section><h2>Database updates <span class="pill green" style="margin-left:6px">Up to date</span></h2>${note}</section>` : "";
+  return `<section><h2>Database updates <span class="pill amber" style="margin-left:6px">${st.pending.length} available</span></h2>
+    ${note}
+    <p style="margin:0 0 6px">This copy's code was updated and its database needs ${st.pending.length === 1 ? "one update" : `${st.pending.length} updates`} to match. Until then, some pages may not work.</p>
+    <p class="meta" style="margin:0 0 10px">${st.pending.map(esc).join(", ")}. A backup is taken first; if it fails, nothing is changed.</p>
+    <form method="post" action="/admin/db-update"><button type="submit" data-busy="Updating…">Apply Updates</button></form>
+    <script>document.querySelectorAll('[data-busy]').forEach(function(b){b.form.addEventListener('submit',function(){b.disabled=true;b.textContent=b.dataset.busy;});});</script>
+  </section>`;
+}
+
+app.post("/admin/db-update", async (c) => {
+  const r = await applyPending(c.env);
+  const detail = r.refused
+    ? r.refused
+    : r.error
+      ? `${r.applied.length ? `Applied ${r.applied.join(", ")}, then ` : ""}${r.error.name} failed: ${r.error.message}. Nothing from that update was kept.`
+      : r.applied.length
+        ? `${r.applied.length} applied (${r.applied.join(", ")})`
+        : "nothing was pending";
+  await c.env.DB.prepare(
+    "INSERT INTO audit_event (actor, entity, entity_id, action, after_summary, source) VALUES (?,'database','migrations','update',?,'app')"
+  )
+    .bind(actor(), detail.slice(0, 500))
+    .run()
+    .catch(() => undefined);
+  const flash = r.refused ? "refused" : r.error ? "failed" : "applied";
+  return c.redirect(`/health?dbflash=${flash}&dbdetail=${encodeURIComponent(detail.slice(0, 400))}`);
 });
 
 /** Unchanged shape from the original /health, kept so monitors and scripts do not break. */
@@ -456,6 +593,23 @@ app.get("/health.json", async (c) => {
     .then((m) => ({ configured: msConfigured(c.env), connected: Boolean(m), error: m?.last_error ?? null }))
     .catch(() => ({ configured: msConfigured(c.env), connected: false, error: "unavailable" }));
   return c.json({ app: "ok", db, backup, stages, attempts, activities, outlook });
+});
+
+app.post("/admin/meeting-sync/exclude", async (c) => {
+  const body = await c.req.parseBody();
+  await changeExclusion(c.env.DB, String(body.phrase ?? ""), true);
+  return c.redirect("/health?meetings=excluded#meeting-sync");
+});
+
+app.post("/admin/meeting-sync/unexclude", async (c) => {
+  const body = await c.req.parseBody();
+  await changeExclusion(c.env.DB, String(body.phrase ?? ""), false);
+  return c.redirect("/health?meetings=excluded#meeting-sync");
+});
+
+app.post("/admin/meeting-sync", async (c) => {
+  await runMeetingSync(c.env, "manual").catch(() => undefined);
+  return c.redirect("/health?meetings=synced#meeting-sync");
 });
 
 app.post("/admin/backup", async (c) => {

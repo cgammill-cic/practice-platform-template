@@ -1,11 +1,11 @@
--- 0022 — pursuits: an engagement now begins before it is won (PURS-001, 2026-09-02).
+-- 0022 — pursuits: an engagement now begins before it is won (PURS-001, the owner 2026-09-02).
 --
 -- ============================================================================================
 -- WHY THIS IS NOT A NEW TABLE
 -- ============================================================================================
--- The request was to "track pursuits" and assign an opportunity to a company. The obvious build is a
--- `pursuit` table that converts into an `engagement` on a win. It was rejected, for one concrete reason
--- above the tidiness argument:
+-- The owner asked to "track pursuits" and assign an opportunity to a company. The obvious build is a
+-- `pursuit` table that converts into an `engagement` on a win. It was rejected, and his call went the
+-- same way, for one concrete reason above the tidiness argument:
 --
 --   `time_entry.engagement_id` is the only way this app attaches hours to work, and `Pursuit/Proposal`
 --   has been an activity since migration 0012. A separate pursuit table means proposal hours either
@@ -13,9 +13,9 @@
 --   spent on. Keeping one row means "org design closes at 40% and costs 22 hours a proposal" is a
 --   query, not a feature.
 --
--- The second reason is that the data already says so. `Organizational Design` for one client (id 3) was in
--- this table as an ACTIVE engagement on 2026-08-17, and on 2026-09-02 it was described as something
--- that a proposal was still being created for. The row was always the pursuit; the schema simply had no way
+-- The second reason is that the data already says so. `Organizational Design` for Datum (id 3) was in
+-- this table as an ACTIVE engagement on 2026-08-17, and on 2026-09-02 the owner described it as something
+-- he is "going to create a proposal for". The row was always the pursuit; the schema simply had no way
 -- to say which part of its life it was in.
 --
 -- ACCEPTED COST, STATED PLAINLY: `engagement` now holds rows that are not customers. A lost pursuit is
@@ -28,13 +28,13 @@
 -- WHY THE TABLE HAS TO BE REBUILT
 -- ============================================================================================
 -- `billing_method` carries a CHECK from migration 0001 allowing only 'hourly','fixed_fee','retainer'.
--- "Time and materials not to exceed" was requested and it is not in that list, so a value the form
+-- The owner named "time and materials not to exceed" and it is not in that list, so a value the form
 -- offers would be rejected by the database on write — the exact failure REL-022 exists to catch.
 -- SQLite cannot alter a CHECK, so the table is rebuilt. The new columns come along in the same rebuild
 -- rather than as eleven ALTERs, because the rebuild is the expensive part and it is already happening.
 --
 -- Two additions to the CHECK, not one:
---   'tm_not_to_exceed'  — what was asked for, with `not_to_exceed_amount` to hold the cap
+--   'tm_not_to_exceed'  — what he asked for, with `not_to_exceed_amount` to hold the cap
 --   'undecided'         — because the column is NOT NULL and a pursuit at 'identified' genuinely does
 --                         not have a billing method yet. Without this, creating a pursuit forces a
 --                         commercial decision months early, and whatever gets picked to get past the
@@ -57,7 +57,7 @@
 -- ============================================================================================
 -- WHY THERE IS NO `probability` COLUMN
 -- ============================================================================================
--- Deliberate. A weighted-pipeline percentage on a book this size is a number an operator would tune every
+-- Deliberate. A weighted-pipeline percentage on a book this size is a number the owner would tune every
 -- week and never trust, and once it exists every report is tempted to multiply by it. Stage is the
 -- honest proxy: `verbal` and `identified` are different odds and everybody already knows it. If a
 -- forecast is ever wanted, the right shape is a fixed percentage per stage held in code, where it can
@@ -66,13 +66,13 @@
 -- ============================================================================================
 -- WHAT IS DELIBERATELY NOT HERE
 -- ============================================================================================
--- The "pipeline core" scope was chosen over the full list. So no PO number, no bill-to contact, no
+-- The owner chose the "pipeline core" scope over the full list. So no PO number, no bill-to contact, no
 -- payment terms, no delivery site, no decision-process notes, no competitor column, and no renewal
 -- dates on live work. All of them were on the table and all of them are second-pass. Invoicing stays
 -- QuickBooks' job; the join keys (`qb_customer_id`, `qb_project_id`) already exist and are untouched.
 --
--- The physical address requested is NOT added here either — `organization.address` has existed
--- since 0001. It is empty on effectively every organization because nothing in the app could ever write it,
+-- The physical address he asked about is NOT added here either — `organization.address` has existed
+-- since 0001. It is empty on all 2,120 organizations because nothing in the app could ever write it,
 -- which is an interface problem, not a schema one, and is fixed on the new organization screen.
 --
 -- ============================================================================================
@@ -190,7 +190,7 @@ CREATE INDEX idx_engagement_next_step ON engagement(next_step_date);
 -- ------------------------------------------------------------------ people on the pursuit
 
 -- The biggest actual gap in the old schema: there was NO relationship between an engagement and a
--- contact. The decision maker and the influencers on a pursuit are the same people already
+-- contact. The owner needs the decision maker and the influencers, and those are the same people already
 -- in the contact table — copying names onto the engagement would create a second, staler copy of the
 -- record this whole app exists to keep straight.
 --
@@ -218,7 +218,7 @@ CREATE INDEX idx_engagement_contact_contact ON engagement_contact(contact_id);
 UPDATE engagement SET status = 'qualifying' WHERE status = 'prospective';
 
 -- service_type becomes a controlled list, so the four existing free-text values are mapped onto it.
--- The interesting one is id 3: `Organizational Design` for that client was filed under 'Executive Support',
+-- The interesting one is id 3: `Organizational Design` for Datum was filed under 'Executive Support',
 -- so a demand report run today would have shown zero demand for org design — which is precisely the
 -- drift a controlled list exists to stop, caught on a table with four rows in it.
 UPDATE engagement SET service_type = 'Change Management'                WHERE service_type = 'Change Management';
